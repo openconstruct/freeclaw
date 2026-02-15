@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freeclaw"
+version = "0.1.0"
+description = "Minimal OpenClaw-like CLI that defaults to NVIDIA NIM (OpenAI-compatible /v1/chat/completions)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "freeclaw contributors" }]
+
+# Base install intentionally keeps dependencies minimal; optional features live in extras.
+dependencies = []
+
+[project.optional-dependencies]
+web = [
+  # Used by web_search; freeclaw also has a fallback import for duckduckgo_search.
+  "ddgs",
+]
+discord = [
+  "discord.py>=2.0.0",
+]
+
+[project.scripts]
+freeclaw = "freeclaw.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["freeclaw*"]
+

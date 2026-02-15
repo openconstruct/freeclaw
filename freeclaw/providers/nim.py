@@ -31,6 +31,16 @@ class NimChatClient:
             )
         return NimChatClient(base_url=cfg.base_url.rstrip("/"), api_key=api_key, model=cfg.model)
 
+    def with_model(self, model: str | None) -> "NimChatClient":
+        if model == self.model:
+            return self
+        return NimChatClient(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=model,
+            timeout_s=self.timeout_s,
+        )
+
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",

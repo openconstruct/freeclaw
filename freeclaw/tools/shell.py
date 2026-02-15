@@ -41,6 +41,8 @@ def _clean_env() -> dict[str, str]:
         "NVIDIA_API_KEY",
         "NIM_API_KEY",
         "NVIDIA_NIM_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
         "DISCORD_BOT_TOKEN",
         "FREECLAW_DISCORD_TOKEN",
     ]:

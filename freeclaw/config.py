@@ -41,11 +41,15 @@ class ClawConfig:
     assistant_tone: str = "Direct, pragmatic, concise. Ask clarifying questions when needed."
     temperature: float = 0.7
     max_tokens: int = 1024
+    max_tool_steps: int = 50
     workspace_dir: str = "workspace"
     tool_root: str = "."
     tool_max_read_bytes: int = 200_000
     tool_max_write_bytes: int = 2_000_000
     tool_max_list_entries: int = 2_000
+    # How often the task timer wakes up to check tasks.md.
+    # 0 disables.
+    task_timer_minutes: int = 30
     skills_dirs: list[str] = field(default_factory=list)
     enabled_skills: list[str] = field(default_factory=list)
     discord_prefix: str = "!claw"
@@ -79,11 +83,13 @@ class ClawConfig:
             ),
             temperature=float(d.get("temperature", 0.7)),
             max_tokens=int(d.get("max_tokens", 1024)),
+            max_tool_steps=int(d.get("max_tool_steps", 50)),
             workspace_dir=str(d.get("workspace_dir") or "workspace"),
             tool_root=str(d.get("tool_root") or "."),
             tool_max_read_bytes=int(d.get("tool_max_read_bytes", 200_000)),
             tool_max_write_bytes=int(d.get("tool_max_write_bytes", 2_000_000)),
             tool_max_list_entries=int(d.get("tool_max_list_entries", 2_000)),
+            task_timer_minutes=int(d.get("task_timer_minutes", 30)),
             skills_dirs=skills_dirs,
             enabled_skills=enabled_skills,
             discord_prefix=str(d.get("discord_prefix") or "!claw"),
@@ -102,11 +108,13 @@ class ClawConfig:
             "assistant_tone": self.assistant_tone,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "max_tool_steps": int(self.max_tool_steps),
             "workspace_dir": self.workspace_dir,
             "tool_root": self.tool_root,
             "tool_max_read_bytes": self.tool_max_read_bytes,
             "tool_max_write_bytes": self.tool_max_write_bytes,
             "tool_max_list_entries": self.tool_max_list_entries,
+            "task_timer_minutes": int(self.task_timer_minutes),
             "skills_dirs": list(self.skills_dirs or []),
             "enabled_skills": list(self.enabled_skills or []),
             "discord_prefix": self.discord_prefix,
@@ -128,11 +136,13 @@ def load_config(path: str | None) -> ClawConfig:
     assistant_tone = os.getenv("FREECLAW_ASSISTANT_TONE")
     temperature = os.getenv("FREECLAW_TEMPERATURE")
     max_tokens = os.getenv("FREECLAW_MAX_TOKENS")
+    max_tool_steps = os.getenv("FREECLAW_MAX_TOOL_STEPS")
     tool_root = os.getenv("FREECLAW_TOOL_ROOT")
     workspace_dir = os.getenv("FREECLAW_WORKSPACE_DIR")
     tool_max_read_bytes = os.getenv("FREECLAW_TOOL_MAX_READ_BYTES")
     tool_max_write_bytes = os.getenv("FREECLAW_TOOL_MAX_WRITE_BYTES")
     tool_max_list_entries = os.getenv("FREECLAW_TOOL_MAX_LIST_ENTRIES")
+    task_timer_minutes = os.getenv("FREECLAW_TASK_TIMER_MINUTES")
     discord_prefix = os.getenv("FREECLAW_DISCORD_PREFIX")
     discord_history_messages = os.getenv("FREECLAW_DISCORD_HISTORY_MESSAGES")
     discord_respond_to_all = os.getenv("FREECLAW_DISCORD_RESPOND_TO_ALL")
@@ -147,6 +157,7 @@ def load_config(path: str | None) -> ClawConfig:
         assistant_tone=(assistant_tone or cfg.assistant_tone),
         temperature=(float(temperature) if temperature else cfg.temperature),
         max_tokens=(int(max_tokens) if max_tokens else cfg.max_tokens),
+        max_tool_steps=(int(max_tool_steps) if max_tool_steps else cfg.max_tool_steps),
         workspace_dir=(workspace_dir or cfg.workspace_dir),
         tool_root=(tool_root or cfg.tool_root),
         tool_max_read_bytes=(int(tool_max_read_bytes) if tool_max_read_bytes else cfg.tool_max_read_bytes),
@@ -155,6 +166,9 @@ def load_config(path: str | None) -> ClawConfig:
         ),
         tool_max_list_entries=(
             int(tool_max_list_entries) if tool_max_list_entries else cfg.tool_max_list_entries
+        ),
+        task_timer_minutes=(
+            int(task_timer_minutes) if task_timer_minutes and str(task_timer_minutes).strip() else cfg.task_timer_minutes
         ),
         skills_dirs=cfg.skills_dirs,
         enabled_skills=cfg.enabled_skills,
@@ -188,11 +202,13 @@ def write_default_config(path: str | None) -> Path:
         "assistant_tone": "Direct, pragmatic, concise. Ask clarifying questions when needed.",
         "temperature": 0.7,
         "max_tokens": 1024,
+        "max_tool_steps": 50,
         "workspace_dir": "workspace",
         "tool_root": ".",
         "tool_max_read_bytes": 200_000,
         "tool_max_write_bytes": 2_000_000,
         "tool_max_list_entries": 2_000,
+        "task_timer_minutes": 30,
         "skills_dirs": [str(default_skills_dir())],
         "enabled_skills": [],
         "discord_prefix": "!claw",

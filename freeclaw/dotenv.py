@@ -115,3 +115,9 @@ def set_env_var(path: Path, key: str, value: str) -> None:
         out.append(f"{key}={_quote_env_value(value)}\n")
 
     path.write_text("".join(out), encoding="utf-8")
+    # Best-effort: keep secrets in env files readable only by the current user.
+    # (No-op on platforms where chmod is unsupported.)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
