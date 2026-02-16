@@ -1,45 +1,18 @@
 # freeclaw
 
-Minimal OpenClaw-like CLI that defaults to NVIDIA NIM (OpenAI-compatible `/v1/chat/completions`).
+Minimal OpenClaw-like CLI that defaults to NVIDIA NIM or OpenRouter (OpenAI-compatible `/v1/chat/completions`).
 
 ## Install
 
 INstall 
+
     git clone https://github.com/openconstruct/freeclaw
     cd freeclaw
     pip install -r requirements.txt
     python -m freeclaw onboard ( you will need an API key and a dicord bot key, I explain in detail here: https://medium.com/@jerryhowell/free-openclaw-alternative-freeclaw-ecf537abbcd0)
     python -m freeclaw discord ( or chat if you want to chat via SSH )
 
-Optional features (extras):
 
-- Web search (`web_search`): `python -m pip install -e '.[web]'` (installs `ddgs`)
-- Discord bot: `python -m pip install -e '.[discord]'`
-- Both: `python -m pip install -e '.[web,discord]'`
-
-Note: `web` is just the name of an extra dependency group, not a Python package.
-
-## Quickstart
-
-1. Set your NVIDIA API key:
-   - `export NVIDIA_API_KEY=...`
-   - Or put it in `./config/.env` (recommended): `NVIDIA_API_KEY=...`
-
-2. Run:
-   - `python -m freeclaw run "Hello from NIM"`
-   - `python -m freeclaw chat`
-   - `python -m freeclaw task-timer`
-   - `python -m freeclaw discord` (Discord bot)
-
-On first run, `freeclaw` will launch an interactive onboarding menu to set up `./config/.env`, tool root, workspace, Discord defaults, and a starter skill.
-Onboarding writes `startup.md`, `persona.md`, `tools.md`, and `tasks.md` into your workspace directory (default: `./workspace`).
-freeclaw includes `persona.md` and `tools.md` in the system prompt (so the bot can persist its persona and accurately list available tools).
-
-Reset everything (delete local config + workspaces; fresh install):
-
-```bash
-python -m freeclaw reset
-```
 
 ## Multiple Agents
 
