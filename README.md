@@ -1,6 +1,6 @@
 # freeclaw
 
-Minimal OpenClaw-like CLI that defaults to NVIDIA NIM or OpenRouter (OpenAI-compatible `/v1/chat/completions`).
+Minimal OpenClaw-like CLI that supports NVIDIA NIM, OpenRouter, and Groq (OpenAI-compatible `/v1/chat/completions`).
 
 ## Install
 
@@ -35,13 +35,16 @@ Discord default behavior:
 Defaults are NIM-first. Override with env vars:
 
 - `FREECLAW_PROVIDER` (default: `nim`)
-- `FREECLAW_BASE_URL` (default for NIM: `https://integrate.api.nvidia.com/v1`; OpenRouter: `https://openrouter.ai/api/v1`)
+- `FREECLAW_BASE_URL` (default for NIM: `https://integrate.api.nvidia.com/v1`; OpenRouter: `https://openrouter.ai/api/v1`; Groq: `https://api.groq.com/openai/v1`)
 - `FREECLAW_MODEL` (default: auto-detect from `/v1/models`, or error if not supported)
 - `FREECLAW_TEMPERATURE` (default: `0.7`)
 - `FREECLAW_MAX_TOKENS` (default: `1024`)
 - `FREECLAW_MAX_TOOL_STEPS` (default: `50`)
 - `FREECLAW_TOOL_ROOT` (default: `.`; tools are constrained to this root)
+- `FREECLAW_WORKSPACE_DIR` (default: `workspace`; state files like `persona.md`, `tasks.md`, and `.freeclaw/*` live here)
 - `FREECLAW_TASK_TIMER_MINUTES` (default: `30`; 0 disables the task timer)
+- `FREECLAW_WEB_UI_ENABLED` (default: `true`; enables Web UI routes in `timer-api`)
+- `FREECLAW_WEB_UI_PORT` (default: `3000`; default `timer-api` bind port)
 - `FREECLAW_TOOL_MAX_READ_BYTES` (default: `200000`)
 - `FREECLAW_TOOL_MAX_WRITE_BYTES` (default: `2000000`)
 - `FREECLAW_TOOL_MAX_LIST_ENTRIES` (default: `2000`)
@@ -59,6 +62,10 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_CUSTOM_TOOLS_BLOCK_NETWORK` (default: `false`; if `true`, blocks `curl/wget/ssh/nc/...` for custom tools)
 - `FREECLAW_LOG_LEVEL` (default: `warning`)
 - `FREECLAW_LOG_FILE` (default: unset; logs go to stderr)
+- `FREECLAW_LOG_FORMAT` (default: `text`; options: `text`, `jsonl`)
+
+Workspace safety:
+- If `workspace_dir` resolves to filesystem root (`/`), freeclaw now falls back to `<cwd>/workspace` to prevent creating `/.freeclaw`.
 
 API key env vars (first found wins):
 
@@ -67,6 +74,8 @@ API key env vars (first found wins):
 - `NVIDIA_NIM_API_KEY`
 - `OPENROUTER_API_KEY` (OpenRouter provider)
 - `OPENAI_API_KEY` (fallback for OpenRouter provider)
+- `GROQ_API_KEY` (Groq provider)
+- `GROQ_KEY` (fallback for Groq provider)
 
 You can also generate a config file:
 
@@ -89,10 +98,17 @@ CLI flags:
 python -m freeclaw --log-level info --log-file ./config/freeclaw.log chat
 ```
 
+JSON lines output:
+
+```bash
+python -m freeclaw --log-level info --log-format jsonl --log-file ./config/freeclaw.jsonl discord
+```
+
 Or env vars:
 
 - `FREECLAW_LOG_LEVEL=debug|info|warning|error`
 - `FREECLAW_LOG_FILE=./config/freeclaw.log`
+- `FREECLAW_LOG_FORMAT=text|jsonl`
 
 ## .env
 
@@ -128,6 +144,20 @@ List only free OpenRouter models (best-effort):
 python -m freeclaw models --provider openrouter --free-only
 ```
 
+## Groq
+
+To use Groq:
+
+- Set `FREECLAW_PROVIDER=groq`
+- Set `GROQ_API_KEY=...` (or `GROQ_KEY=...`)
+- Optionally set `FREECLAW_BASE_URL=https://api.groq.com/openai/v1`
+
+List Groq models:
+
+```bash
+python -m freeclaw models --provider groq
+```
+
 ## Tools
 
 By default, `run` and `chat` enable basic filesystem tools (OpenAI function-calling compatible):
@@ -148,6 +178,8 @@ Additional tools:
 - Web: `web_search` (DuckDuckGo via `ddgs`) and `web_fetch` (public http(s) URL fetch; blocks localhost/private IPs).
 - HTTP: `http_request_json` calls a public http(s) JSON API and returns parsed JSON (blocks localhost/private IPs).
 - Memory: `memory_*` stores notes in a local SQLite DB. This memory is shared across CLI + Discord for the current project by default; override with `FREECLAW_MEMORY_DB`. Notes can be `pinned` or given a `ttl_seconds` expiry.
+- Task scheduler: `task_*` manages recurring `tasks.md` entries (list/add/update/enable/disable/run-now) in structured form.
+- Docs: `doc_ingest`/`doc_inject`, `doc_search`, `doc_get`, `doc_list`, `doc_delete` build and manage a persistent workspace document index (text + PDF via `pypdf`).
 - Shell: `sh_exec` executes commands in `tool_root` (enabled by default; disable with `--no-shell` or `FREECLAW_ENABLE_SHELL=false`). Network tools are allowed by default; set `FREECLAW_SHELL_BLOCK_NETWORK=true` to block `curl/wget/ssh/nc/...`.
 - Custom: additional tools are loaded from JSON specs under `<workspace>/.freeclaw/tools` (enabled by default; disable with `--no-custom-tools` or `FREECLAW_ENABLE_CUSTOM_TOOLS=false`).
 
@@ -199,6 +231,28 @@ Or run a single tick (useful for cron/systemd timers):
 python -m freeclaw task-timer --once
 ```
 
+### Timer API (Server-Managed)
+
+If you want freeclaw itself to handle scheduling (instead of systemd), run:
+
+```bash
+python -m freeclaw timer-api
+```
+
+This starts an HTTP server with a background scheduler that checks `tasks.md` and wakes the model when tasks are due.
+By default it binds to `127.0.0.1:3000`. You can disable Web UI routes in onboarding, or at runtime with `--no-web-ui`.
+
+Useful endpoints:
+
+- `GET /` (Web UI dashboard)
+- `GET /health`
+- `GET /timer/status`
+- `GET /api/system/metrics` (CPU/RAM/temp/GPU/VRAM/uptime/bandwidth/storage/top processes + active bot token usage with 24h/7d history)
+- `POST /timer/tick` (force a tick now)
+- `POST /timer/enable`
+- `POST /timer/disable`
+- `POST /timer/config` with JSON body like `{"minutes":30}`
+
 Example `tasks.md`:
 
 ```md
@@ -249,6 +303,8 @@ Install dependencies:
 pip install -e ".[discord]"
 ```
 
+`.[discord]` now includes `pypdf`, so the bot can parse text from attached PDFs.
+
 Web tools (DDG search + URL fetch) require:
 
 ```bash
@@ -266,6 +322,13 @@ python -m freeclaw discord --prefix "!claw" --tool-root /home/jerr
 ```
 
 In Discord, you must enable the **Message Content Intent** for the bot if you want it to read and respond to normal messages (including prefix-based commands).
+
+When users send message attachments, the bot will download and parse:
+
+- PDF files (`.pdf`)
+- Common text/code formats (`.txt`, `.md`, `.csv`, `.json`, `.html`, `.py`, etc.)
+
+Parsed attachment text is appended to the model prompt for that message.
 
 If you want the bot to respond to every message (no prefix needed):
 

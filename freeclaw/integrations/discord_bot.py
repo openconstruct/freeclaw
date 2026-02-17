@@ -1,28 +1,174 @@
 import asyncio
 import datetime as dt
+import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..agent import run_agent
+from ..paths import config_dir as _config_dir
+from ..paths import memory_db_path as _default_memory_db_path
 from ..tools import ToolContext, tool_schemas
 from ..tools.memory import memory_search
-from ..paths import memory_db_path as _default_memory_db_path
 
 log = logging.getLogger(__name__)
 
 
 DISCORD_MESSAGE_LIMIT = 2000
+_MAX_ATTACHMENTS = 4
+_MAX_ATTACHMENT_BYTES = 2_000_000
+_MAX_ATTACHMENT_CHARS_PER_FILE = 12_000
+_MAX_ATTACHMENT_TOTAL_CHARS = 40_000
+_TOKEN_HISTORY_RETENTION_DAYS = 7
+_TEXT_ATTACHMENT_EXTS = {
+    ".txt",
+    ".md",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".html",
+    ".htm",
+    ".css",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".py",
+    ".java",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".go",
+    ".rs",
+    ".rb",
+    ".php",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".log",
+    ".env",
+}
 
 _USER_MD_ID_RE = re.compile(r"(?i)\\b(?:discord_)?(?:user_id|author_id)\\b\\s*[:=]\\s*(\\d{15,25})\\b")
 _USER_MD_NAME_RE = re.compile(r"(?i)\\b(?:discord_)?user_name\\b\\s*[:=]\\s*(.+?)\\s*$")
 _DISCORD_SNOWFLAKE_RE = re.compile(r"\\b(\\d{15,25})\\b")
+
+
+def _safe_label(s: str) -> str:
+    out: list[str] = []
+    for ch in (s or "").strip():
+        if ch.isalnum() or ch in {"-", "_"}:
+            out.append(ch)
+        elif ch.isspace():
+            out.append("-")
+    v = "".join(out).strip("-_")
+    return v[:80] if v else "base"
+
+
+def _provider_name(client: Any) -> str:
+    nm = type(client).__name__.lower()
+    if "openrouter" in nm:
+        return "openrouter"
+    if "groq" in nm:
+        return "groq"
+    if "nim" in nm:
+        return "nim"
+    return nm or "unknown"
+
+
+def _runtime_root() -> Path:
+    return _config_dir() / "runtime"
+
+
+def _bot_status_dir() -> Path:
+    return _runtime_root() / "bots"
+
+
+def _token_history_dir() -> Path:
+    return _runtime_root() / "token_usage"
+
+
+def _atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(obj, ensure_ascii=True) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def _cleanup_old_token_history(*, now_s: float, retention_days: int) -> None:
+    cutoff = dt.datetime.fromtimestamp(now_s - (retention_days * 86400.0), tz=dt.timezone.utc).date()
+    hdir = _token_history_dir()
+    try:
+        for p in hdir.glob("*.jsonl"):
+            stem = p.stem
+            try:
+                day = dt.date.fromisoformat(stem)
+            except Exception:
+                continue
+            if day < cutoff:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+
+def _to_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+
+def _extract_usage_tokens(resp: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    usage = resp.get("usage")
+    if not isinstance(usage, dict):
+        return None, None, None
+    prompt = _to_int(usage.get("prompt_tokens"))
+    completion = _to_int(usage.get("completion_tokens"))
+    if prompt is None:
+        prompt = _to_int(usage.get("input_tokens"))
+    if completion is None:
+        completion = _to_int(usage.get("output_tokens"))
+    total = _to_int(usage.get("total_tokens"))
+    if total is None and (prompt is not None or completion is not None):
+        total = int((prompt or 0) + (completion or 0))
+    return prompt, completion, total
 
 
 def _parse_user_md(text: str) -> tuple[int | None, str | None]:
@@ -69,6 +215,21 @@ def _once_enabled(workspace: Path | None) -> bool:
         return p.exists() and p.is_file()
     except Exception:
         return False
+
+
+def _consume_once_marker(workspace: Path | None) -> None:
+    """
+    Best-effort one-way switch: once a user is bound, remove once.md so the
+    first-user binding flow cannot repeat.
+    """
+    if workspace is None:
+        return
+    try:
+        p = workspace / "once.md"
+        if p.exists() and p.is_file():
+            p.unlink()
+    except Exception:
+        return
 
 
 def _load_authorized_user(workspace: Path | None) -> tuple[int | None, str | None]:
@@ -136,6 +297,14 @@ def _ensure_and_check_authorized_user(
         return True, None, None, False
 
     auth_id, auth_name = _load_authorized_user(workspace)
+    # If a user is already bound, consume once.md immediately regardless of who is asking.
+    # This keeps once.md truly one-time and avoids it lingering in repos.
+    if auth_id is not None:
+        _consume_once_marker(workspace)
+        if author_id is not None and int(author_id) == int(auth_id):
+            return True, auth_id, (auth_name or author_name), False
+        return False, auth_id, auth_name, False
+
     if auth_id is None:
         if author_id is None:
             return True, None, None, False
@@ -144,14 +313,10 @@ def _ensure_and_check_authorized_user(
         if auth_id2 is None:
             # If we couldn't persist the binding, don't lock anyone out.
             return True, None, None, False
+        _consume_once_marker(workspace)
         allowed = int(author_id) == int(auth_id2)
         return allowed, auth_id2, auth_name2, (bool(wrote) and bool(allowed))
-
-    if author_id is not None and int(author_id) == int(auth_id):
-        # If the file doesn't include a name, opportunistically keep the runtime name.
-        return True, auth_id, (auth_name or author_name), False
-
-    return False, auth_id, auth_name, False
+    return True, None, None, False
 
 
 def _extract_finish_reason(resp: dict[str, Any]) -> str | None:
@@ -262,6 +427,102 @@ def _strip_bot_mention(content: str, bot_user_id: int) -> str:
     return mention_re.sub("", content).strip()
 
 
+def _attachment_is_text(*, name: str, content_type: str | None) -> bool:
+    ext = Path(name or "").suffix.lower()
+    if ext in _TEXT_ATTACHMENT_EXTS:
+        return True
+    ct = (content_type or "").strip().lower()
+    if ct.startswith("text/"):
+        return True
+    return ct in {
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/x-javascript",
+        "application/sql",
+    }
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    from pypdf import PdfReader  # type: ignore
+
+    out: list[str] = []
+    reader = PdfReader(io.BytesIO(data))
+    for i, page in enumerate(reader.pages, start=1):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            out.append(f"[page {i}]\n{t.strip()}\n")
+    return "\n".join(out).strip()
+
+
+async def _build_attachments_prompt_block(attachments: list[Any]) -> str:
+    if not attachments:
+        return ""
+    parts: list[str] = []
+    total_chars = 0
+    for a in attachments[:_MAX_ATTACHMENTS]:
+        name = str(getattr(a, "filename", "") or "attachment")
+        size = int(getattr(a, "size", 0) or 0)
+        content_type = (str(getattr(a, "content_type", "") or "").strip() or None)
+        ext = Path(name).suffix.lower()
+
+        if size > _MAX_ATTACHMENT_BYTES:
+            parts.append(
+                f"- {name}: skipped (file too large: {size} bytes > {_MAX_ATTACHMENT_BYTES} bytes)"
+            )
+            continue
+        try:
+            data = await a.read()
+        except Exception as e:
+            parts.append(f"- {name}: failed to download ({type(e).__name__}: {e})")
+            continue
+
+        text = ""
+        try:
+            if ext == ".pdf":
+                text = _extract_pdf_text(data)
+            elif _attachment_is_text(name=name, content_type=content_type):
+                text = data.decode("utf-8", errors="replace")
+            else:
+                parts.append(f"- {name}: unsupported attachment type (only PDF + text/code formats are parsed)")
+                continue
+        except Exception as e:
+            parts.append(f"- {name}: failed to parse ({type(e).__name__}: {e})")
+            continue
+
+        text = (text or "").strip()
+        if not text:
+            parts.append(f"- {name}: parsed, but no text content found")
+            continue
+
+        if len(text) > _MAX_ATTACHMENT_CHARS_PER_FILE:
+            text = text[:_MAX_ATTACHMENT_CHARS_PER_FILE] + "\n...[truncated]"
+        remain = _MAX_ATTACHMENT_TOTAL_CHARS - total_chars
+        if remain <= 0:
+            parts.append("- additional attachments omitted (total attachment text limit reached)")
+            break
+        if len(text) > remain:
+            text = text[:remain] + "\n...[truncated]"
+        total_chars += len(text)
+        parts.append(
+            "\n".join(
+                [
+                    f"- {name} ({len(data)} bytes):",
+                    "```text",
+                    text,
+                    "```",
+                ]
+            )
+        )
+
+    if not parts:
+        return ""
+    return "Discord attachments (parsed):\n" + "\n\n".join(parts)
+
+
 @dataclass
 class DiscordSession:
     messages: list[dict[str, Any]]
@@ -287,6 +548,7 @@ async def run_discord_bot(
     history_messages: int,
     workspace: Path | None = None,
     tools_builder: Any = None,
+    bot_label: str | None = None,
 ) -> None:
     try:
         import discord  # type: ignore
@@ -301,6 +563,87 @@ async def run_discord_bot(
     bot_token = token or os.getenv("DISCORD_BOT_TOKEN") or os.getenv("FREECLAW_DISCORD_TOKEN")
     if not bot_token:
         raise SystemExit("Missing Discord bot token. Set DISCORD_BOT_TOKEN or pass --token.")
+    log.info(
+        "discord bot init label=%s provider=%s model=%s tools=%s history_messages=%d",
+        (_safe_label(bot_label or "base")),
+        _provider_name(client),
+        (getattr(client, "model", None) or "auto"),
+        bool(enable_tools),
+        int(history_messages),
+    )
+
+    label = _safe_label(bot_label or "base")
+    provider = _provider_name(client)
+    pid = int(os.getpid())
+    started_s = float(time.time())
+    stats_lock = threading.Lock()
+    runtime_status_path = _bot_status_dir() / f"{label}--{pid}.json"
+    runtime_last_cleanup_s = {"value": 0.0}
+    usage_stats: dict[str, Any] = {
+        "bot_label": label,
+        "pid": pid,
+        "provider": provider,
+        "discord_user_id": None,
+        "discord_user_name": None,
+        "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "started_s": started_s,
+        "last_seen_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "last_seen_s": started_s,
+        "requests": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "last_model": (str(getattr(client, "model", "")).strip() or None),
+    }
+
+    def _write_runtime_status() -> None:
+        with stats_lock:
+            snap = dict(usage_stats)
+        _atomic_write_json(runtime_status_path, snap)
+
+    def _record_usage(*, model: str | None, prompt_t: int | None, completion_t: int | None, total_t: int | None) -> None:
+        now_s = float(time.time())
+        now_iso = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        with stats_lock:
+            usage_stats["last_seen_s"] = now_s
+            usage_stats["last_seen_at"] = now_iso
+            usage_stats["requests"] = int(usage_stats.get("requests", 0) or 0) + 1
+            if isinstance(model, str) and model.strip():
+                usage_stats["last_model"] = model.strip()
+            if prompt_t is not None:
+                usage_stats["prompt_tokens"] = int(usage_stats.get("prompt_tokens", 0) or 0) + int(prompt_t)
+            if completion_t is not None:
+                usage_stats["completion_tokens"] = int(usage_stats.get("completion_tokens", 0) or 0) + int(completion_t)
+            if total_t is not None:
+                usage_stats["total_tokens"] = int(usage_stats.get("total_tokens", 0) or 0) + int(total_t)
+        _write_runtime_status()
+
+        if prompt_t is None and completion_t is None and total_t is None:
+            return
+
+        day = dt.datetime.fromtimestamp(now_s, tz=dt.timezone.utc).date().isoformat()
+        event = {
+            "ts": now_s,
+            "time": now_iso,
+            "bot_label": label,
+            "pid": pid,
+            "provider": provider,
+            "model": (model.strip() if isinstance(model, str) and model.strip() else None),
+            "prompt_tokens": prompt_t,
+            "completion_tokens": completion_t,
+            "total_tokens": total_t,
+        }
+        try:
+            _append_jsonl(_token_history_dir() / f"{day}.jsonl", event)
+        except Exception:
+            log.debug("failed to append token usage event", exc_info=True)
+
+        last_cleanup = float(runtime_last_cleanup_s.get("value", 0.0) or 0.0)
+        if (now_s - last_cleanup) >= 3600.0:
+            runtime_last_cleanup_s["value"] = now_s
+            _cleanup_old_token_history(now_s=now_s, retention_days=_TOKEN_HISTORY_RETENTION_DAYS)
+
+    _write_runtime_status()
 
     # Workspace is used for Discord auth (once.md/user.md) even when tools are disabled.
     ws = workspace or (tool_ctx.workspace if tool_ctx is not None else None)
@@ -380,6 +723,7 @@ async def run_discord_bot(
                 "Notes:",
                 "- Model/temp/tokens overrides persist per channel/DM across restarts.",
                 "- Use `default`/`auto`/`reset` to clear overrides for `/model`, `/temp`, `/tokens`.",
+                "- Message attachments are parsed and included (PDF + common text/code formats).",
             ]
         )
 
@@ -544,6 +888,12 @@ async def run_discord_bot(
             assert self.user is not None
             log.info("freeclaw discord logged in as %s (id=%s)", self.user, self.user.id)
             log.info("prefix=%r respond_to_all=%s enable_tools=%s", prefix, bool(respond_to_all), bool(enable_tools))
+            with stats_lock:
+                usage_stats["discord_user_id"] = int(self.user.id)
+                usage_stats["discord_user_name"] = str(self.user)
+                usage_stats["last_seen_s"] = float(time.time())
+                usage_stats["last_seen_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            _write_runtime_status()
 
         async def _run_prompt(
             self,
@@ -558,6 +908,7 @@ async def run_discord_bot(
             bot_id = int(self.user.id)
             lk = get_lock(bot_id=bot_id, channel_id=channel_id)
             async with lk:
+                t0 = time.time()
                 sess = get_session(bot_id=bot_id, channel_id=channel_id)
                 sess.messages.append({"role": "user", "content": prompt})
                 truncate_in_place(sess.messages)
@@ -566,6 +917,13 @@ async def run_discord_bot(
                 eff_max_tokens = sess.max_tokens if sess.max_tokens is not None else max_tokens
                 eff_model = sess.model if sess.model is not None else client.model
                 eff_client = client if eff_model == client.model else client.with_model(eff_model)
+                log.info(
+                    "discord prompt start channel_id=%s author_id=%s model=%s prompt_chars=%d",
+                    int(channel_id),
+                    (int(author_id) if author_id is not None else -1),
+                    (eff_model or "auto"),
+                    len(prompt or ""),
+                )
 
                 # Pass a copy so run_agent can append tool messages without polluting the persisted chat history.
                 base_agent_msgs = [dict(m) for m in sess.messages]
@@ -613,6 +971,7 @@ async def run_discord_bot(
                         detail = detail[:1800] + "..."
                     return _split_discord_message(detail)
 
+                usage_resp: dict[str, Any] = result.raw_last_response
                 text = (result.text or "").strip()
                 if not text:
                     fr = _extract_finish_reason(result.raw_last_response) or "unknown"
@@ -636,6 +995,7 @@ async def run_discord_bot(
                         if text2:
                             recovered = True
                             text = text2
+                            usage_resp = resp2
                             log.info(
                                 "recovered empty response by retrying without tools (channel_id=%s model=%s)",
                                 channel_id,
@@ -646,6 +1006,21 @@ async def run_discord_bot(
 
                     if not recovered:
                         text = _summarize_empty_model_response(model=eff_model, resp=result.raw_last_response)
+
+                prompt_t, completion_t, total_t = _extract_usage_tokens(usage_resp)
+                _record_usage(
+                    model=(eff_model if isinstance(eff_model, str) else None),
+                    prompt_t=prompt_t,
+                    completion_t=completion_t,
+                    total_t=total_t,
+                )
+                log.info(
+                    "discord prompt done channel_id=%s steps=%d elapsed_ms=%.1f tokens_total=%s",
+                    int(channel_id),
+                    int(result.steps),
+                    (time.time() - t0) * 1000.0,
+                    (str(total_t) if total_t is not None else "n/a"),
+                )
                 sess.messages.append({"role": "assistant", "content": text})
                 truncate_in_place(sess.messages)
                 _save_session(bot_id=bot_id, channel_id=channel_id, sess=sess)
@@ -655,12 +1030,11 @@ async def run_discord_bot(
         async def on_message(self, message: "discord.Message") -> None:  # type: ignore[name-defined]
             if message.author.bot:
                 return
-            if message.content is None:
-                return
 
             assert self.user is not None
-            content = message.content.strip()
-            if not content:
+            content = (message.content or "").strip()
+            has_attachments = bool(getattr(message, "attachments", None))
+            if not content and not has_attachments:
                 return
             channel_id = message.channel.id
 
@@ -677,7 +1051,7 @@ async def run_discord_bot(
                 triggered = True
                 explicit_cmd = True
                 prompt = _strip_bot_mention(content, self.user.id)
-            elif respond_to_all:
+            elif respond_to_all and (content or has_attachments):
                 triggered = True
                 prompt = content
 
@@ -702,8 +1076,19 @@ async def run_discord_bot(
 
             if not triggered:
                 return
+            log.debug(
+                "discord message trigger channel_id=%s author_id=%s explicit_cmd=%s attachments=%s",
+                int(channel_id),
+                int(message.author.id),
+                bool(explicit_cmd),
+                bool(has_attachments),
+            )
 
-            if explicit_cmd and not prompt:
+            attachments_block = ""
+            if has_attachments:
+                attachments_block = await _build_attachments_prompt_block(list(message.attachments))
+
+            if explicit_cmd and not prompt and not attachments_block:
                 await message.channel.send(
                     f"Usage: `{prefix} <prompt>` or `{prefix} new` or `{prefix} reset` or `{prefix} help`"
                 )  # type: ignore[attr-defined]
@@ -730,11 +1115,17 @@ async def run_discord_bot(
                 await message.channel.send("Session cleared.")  # type: ignore[attr-defined]
                 return
 
+            final_prompt = prompt
+            if attachments_block:
+                if not final_prompt:
+                    final_prompt = "Read and use the attached file(s)."
+                final_prompt = final_prompt.strip() + "\n\n" + attachments_block
+
             async with message.channel.typing():  # type: ignore[attr-defined]
                 chunks = await self._run_prompt(
                     channel=message.channel,
                     channel_id=channel_id,
-                    prompt=prompt,
+                    prompt=final_prompt,
                     author_id=int(message.author.id),
                     guild_id=(int(message.guild.id) if getattr(message, "guild", None) is not None else None),
                 )
@@ -865,9 +1256,18 @@ async def run_discord_bot(
             base = client.model or "auto"
             ov = sess.model
             eff = ov or base
-            await interaction.response.send_message(
-                f"Model: `{eff}` (override: `{ov}`)" if ov else f"Model: `{eff}` (override: default/auto)"
-            )  # type: ignore[attr-defined]
+            reset_cmd = (
+                f"/model model:{base}"
+                if (client.model and client.model.strip())
+                else "/model model:auto"
+            )
+            lines = [
+                f"Current model: `{eff}`",
+                f"Agent default model: `{base}`",
+                (f"Channel override: `{ov}`" if ov else "Channel override: `default/auto`"),
+                f"Re-set this channel to the agent default: `{reset_cmd}`",
+            ]
+            await interaction.response.send_message("\n".join(lines))  # type: ignore[attr-defined]
             return
 
         raw = model.strip()
@@ -1031,4 +1431,29 @@ async def run_discord_bot(
     client_app.tree.add_command(mem_group)  # type: ignore[attr-defined]
     client_app.tree.add_command(persona_group)  # type: ignore[attr-defined]
 
-    await client_app.start(bot_token)
+    heartbeat_stop = asyncio.Event()
+
+    async def _heartbeat_loop() -> None:
+        while not heartbeat_stop.is_set():
+            with stats_lock:
+                usage_stats["last_seen_s"] = float(time.time())
+                usage_stats["last_seen_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            _write_runtime_status()
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                continue
+
+    hb_task = asyncio.create_task(_heartbeat_loop())
+    try:
+        await client_app.start(bot_token)
+    finally:
+        heartbeat_stop.set()
+        try:
+            await hb_task
+        except Exception:
+            pass
+        try:
+            runtime_status_path.unlink(missing_ok=True)
+        except Exception:
+            pass

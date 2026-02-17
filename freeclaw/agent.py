@@ -91,6 +91,18 @@ def _extract_finish_reason(resp: dict[str, Any]) -> str | None:
         return None
 
 
+def _is_tool_grammar_error(exc: Exception) -> bool:
+    s = str(exc or "")
+    if not s:
+        return False
+    m = s.lower()
+    return (
+        ("invalid grammar request" in m)
+        or ("structural_tag" in m)
+        or ("tool_calls_section_begin" in m)
+    )
+
+
 def run_agent(
     *,
     client: ChatClient,
@@ -104,6 +116,15 @@ def run_agent(
     tools_override: list[dict[str, Any]] | None = None,
     tools_builder: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> AgentResult:
+    log.debug(
+        "agent start model=%s temperature=%.3f max_tokens=%d enable_tools=%s max_tool_steps=%d messages=%d",
+        getattr(client, "model", None),
+        float(temperature),
+        int(max_tokens),
+        bool(enable_tools),
+        int(max_tool_steps),
+        len(messages),
+    )
     steps = 0
     last_resp: dict[str, Any] = {}
 
@@ -114,12 +135,27 @@ def run_agent(
             else (tools_override if tools_override is not None else (tool_schemas() if enable_tools else None))
         )
         steps += 1
-        last_resp = client.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-        )
+        try:
+            last_resp = client.chat(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+            )
+        except Exception as e:
+            # Some providers (notably NIM) can intermittently reject tool schemas
+            # with grammar/cache errors. Retry once without tools for this turn.
+            if tools and _is_tool_grammar_error(e):
+                log.warning("provider rejected tool grammar; retrying this turn without tools: %s", e)
+                last_resp = client.chat(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=None,
+                )
+            else:
+                raise
+        log.debug("agent step=%d finish_reason=%s", steps, (_extract_finish_reason(last_resp) or "unknown"))
         msg = _extract_message(last_resp)
         raw_tool_calls = msg.get("tool_calls") if isinstance(msg.get("tool_calls"), list) else []
         tool_calls = _sanitize_tool_calls(raw_tool_calls)
@@ -135,6 +171,7 @@ def run_agent(
         if not tool_calls:
             text = client.extract_text(last_resp)
             if str(text or "").strip():
+                log.info("agent completed steps=%d finish_reason=%s", steps, (_extract_finish_reason(last_resp) or "unknown"))
                 return AgentResult(
                     text=text,
                     raw_last_response=last_resp,
@@ -181,6 +218,7 @@ def run_agent(
 
                     text2 = client.extract_text(last_resp)
                     if str(text2 or "").strip():
+                        log.info("agent completed via empty-response recovery steps=%d", steps)
                         return AgentResult(
                             text=text2,
                             raw_last_response=last_resp,

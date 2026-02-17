@@ -50,6 +50,8 @@ class ClawConfig:
     # How often the task timer wakes up to check tasks.md.
     # 0 disables.
     task_timer_minutes: int = 30
+    web_ui_enabled: bool = True
+    web_ui_port: int = 3000
     skills_dirs: list[str] = field(default_factory=list)
     enabled_skills: list[str] = field(default_factory=list)
     discord_prefix: str = "!claw"
@@ -90,6 +92,8 @@ class ClawConfig:
             tool_max_write_bytes=int(d.get("tool_max_write_bytes", 2_000_000)),
             tool_max_list_entries=int(d.get("tool_max_list_entries", 2_000)),
             task_timer_minutes=int(d.get("task_timer_minutes", 30)),
+            web_ui_enabled=bool(d.get("web_ui_enabled", True)),
+            web_ui_port=int(d.get("web_ui_port", 3000)),
             skills_dirs=skills_dirs,
             enabled_skills=enabled_skills,
             discord_prefix=str(d.get("discord_prefix") or "!claw"),
@@ -115,6 +119,8 @@ class ClawConfig:
             "tool_max_write_bytes": self.tool_max_write_bytes,
             "tool_max_list_entries": self.tool_max_list_entries,
             "task_timer_minutes": int(self.task_timer_minutes),
+            "web_ui_enabled": bool(self.web_ui_enabled),
+            "web_ui_port": int(self.web_ui_port),
             "skills_dirs": list(self.skills_dirs or []),
             "enabled_skills": list(self.enabled_skills or []),
             "discord_prefix": self.discord_prefix,
@@ -143,6 +149,8 @@ def load_config(path: str | None) -> ClawConfig:
     tool_max_write_bytes = os.getenv("FREECLAW_TOOL_MAX_WRITE_BYTES")
     tool_max_list_entries = os.getenv("FREECLAW_TOOL_MAX_LIST_ENTRIES")
     task_timer_minutes = os.getenv("FREECLAW_TASK_TIMER_MINUTES")
+    web_ui_enabled = os.getenv("FREECLAW_WEB_UI_ENABLED")
+    web_ui_port = os.getenv("FREECLAW_WEB_UI_PORT")
     discord_prefix = os.getenv("FREECLAW_DISCORD_PREFIX")
     discord_history_messages = os.getenv("FREECLAW_DISCORD_HISTORY_MESSAGES")
     discord_respond_to_all = os.getenv("FREECLAW_DISCORD_RESPOND_TO_ALL")
@@ -170,6 +178,12 @@ def load_config(path: str | None) -> ClawConfig:
         task_timer_minutes=(
             int(task_timer_minutes) if task_timer_minutes and str(task_timer_minutes).strip() else cfg.task_timer_minutes
         ),
+        web_ui_enabled=(
+            str(web_ui_enabled).strip().lower() in {"1", "true", "yes", "y", "on"}
+            if web_ui_enabled is not None
+            else cfg.web_ui_enabled
+        ),
+        web_ui_port=(int(web_ui_port) if web_ui_port and str(web_ui_port).strip() else cfg.web_ui_port),
         skills_dirs=cfg.skills_dirs,
         enabled_skills=cfg.enabled_skills,
         discord_prefix=(discord_prefix or cfg.discord_prefix),
@@ -209,6 +223,8 @@ def write_default_config(path: str | None) -> Path:
         "tool_max_write_bytes": 2_000_000,
         "tool_max_list_entries": 2_000,
         "task_timer_minutes": 30,
+        "web_ui_enabled": True,
+        "web_ui_port": 3000,
         "skills_dirs": [str(default_skills_dir())],
         "enabled_skills": [],
         "discord_prefix": "!claw",

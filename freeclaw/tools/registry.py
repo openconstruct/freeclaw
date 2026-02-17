@@ -17,8 +17,10 @@ from .fs import (
 )
 from .http import http_request_json
 from .memory import memory_add, memory_delete, memory_get, memory_search
+from .doc_ingest import doc_delete, doc_get, doc_ingest, doc_list, doc_search
 from .shell import sh_exec
 from .search import text_search
+from .task_scheduler import task_add, task_disable, task_enable, task_list, task_run_now, task_update
 from .web import web_fetch, web_search
 
 
@@ -49,6 +51,18 @@ def tool_schemas(
         "memory_get",
         "memory_search",
         "memory_delete",
+        "task_list",
+        "task_add",
+        "task_update",
+        "task_disable",
+        "task_enable",
+        "task_run_now",
+        "doc_ingest",
+        "doc_inject",
+        "doc_search",
+        "doc_get",
+        "doc_list",
+        "doc_delete",
         "sh_exec",
     }
     tools: list[dict[str, Any]] = [
@@ -359,6 +373,190 @@ def tool_schemas(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_list",
+                "description": "List recurring tasks from workspace/tasks.md with ids for later updates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "include_disabled": {"type": "boolean", "default": True},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_add",
+                "description": "Add a recurring task to workspace/tasks.md using <minutes>-<task> format.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "minutes": {"type": "integer", "minimum": 1},
+                        "task": {"type": "string"},
+                        "enabled": {"type": "boolean", "default": True},
+                        "allow_duplicate": {"type": "boolean", "default": False},
+                    },
+                    "required": ["minutes", "task"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_update",
+                "description": "Update an existing task by task_id or exact task text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": ["integer", "null"], "default": None},
+                        "task": {"type": ["string", "null"], "default": None},
+                        "new_minutes": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                        "new_task": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_disable",
+                "description": "Disable a recurring task in tasks.md by task_id or exact task text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": ["integer", "null"], "default": None},
+                        "task": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_enable",
+                "description": "Enable a disabled recurring task in tasks.md by task_id or exact task text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": ["integer", "null"], "default": None},
+                        "task": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_run_now",
+                "description": "Mark a task as due immediately for the next timer tick by clearing its last-run state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": ["integer", "null"], "default": None},
+                        "task": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_ingest",
+                "description": "Ingest a local text/PDF document into a persistent workspace index for later retrieval/search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path relative to tool_root."},
+                        "key": {"type": ["string", "null"], "default": None},
+                        "title": {"type": ["string", "null"], "default": None},
+                        "replace": {"type": "boolean", "default": True},
+                        "max_chars": {"type": "integer", "minimum": 1000, "maximum": 1000000, "default": 200000},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_inject",
+                "description": "Alias of doc_ingest: ingest a local text/PDF document into persistent workspace index.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path relative to tool_root."},
+                        "key": {"type": ["string", "null"], "default": None},
+                        "title": {"type": ["string", "null"], "default": None},
+                        "replace": {"type": "boolean", "default": True},
+                        "max_chars": {"type": "integer", "minimum": 1000, "maximum": 1000000, "default": 200000},
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_search",
+                "description": "Search previously ingested documents by keyword/full text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_get",
+                "description": "Fetch an ingested document by id or key (optionally include content excerpt).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["integer", "null"], "default": None},
+                        "key": {"type": ["string", "null"], "default": None},
+                        "include_content": {"type": "boolean", "default": True},
+                        "max_chars": {"type": "integer", "minimum": 500, "maximum": 200000, "default": 8000},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_list",
+                "description": "List ingested documents with pagination and optional text filter.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+                        "offset": {"type": "integer", "minimum": 0, "default": 0},
+                        "query": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "doc_delete",
+                "description": "Delete an ingested document by id or key.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["integer", "null"], "default": None},
+                        "key": {"type": ["string", "null"], "default": None},
+                    },
+                },
+            },
+        },
     ]
     if include_shell:
         tools.append(
@@ -538,6 +736,90 @@ def dispatch_tool_call(ctx: ToolContext, name: str, arguments_json: str) -> dict
         )
     if name == "memory_delete":
         return memory_delete(
+            ctx,
+            id=(None if args.get("id") is None else int(args.get("id"))),
+            key=(None if args.get("key") is None else str(args.get("key"))),
+        )
+    if name == "task_list":
+        return task_list(
+            ctx,
+            include_disabled=bool(args.get("include_disabled", True)),
+        )
+    if name == "task_add":
+        return task_add(
+            ctx,
+            minutes=int(args.get("minutes", 0)),
+            task=str(args.get("task", "")),
+            enabled=bool(args.get("enabled", True)),
+            allow_duplicate=bool(args.get("allow_duplicate", False)),
+        )
+    if name == "task_update":
+        return task_update(
+            ctx,
+            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
+            task=(None if args.get("task") is None else str(args.get("task"))),
+            new_minutes=(None if args.get("new_minutes") is None else int(args.get("new_minutes"))),
+            new_task=(None if args.get("new_task") is None else str(args.get("new_task"))),
+        )
+    if name == "task_disable":
+        return task_disable(
+            ctx,
+            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
+            task=(None if args.get("task") is None else str(args.get("task"))),
+        )
+    if name == "task_enable":
+        return task_enable(
+            ctx,
+            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
+            task=(None if args.get("task") is None else str(args.get("task"))),
+        )
+    if name == "task_run_now":
+        return task_run_now(
+            ctx,
+            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
+            task=(None if args.get("task") is None else str(args.get("task"))),
+        )
+    if name == "doc_ingest":
+        return doc_ingest(
+            ctx,
+            path=str(args.get("path", "")),
+            key=(None if args.get("key") is None else str(args.get("key"))),
+            title=(None if args.get("title") is None else str(args.get("title"))),
+            replace=bool(args.get("replace", True)),
+            max_chars=int(args.get("max_chars", 200000)),
+        )
+    if name == "doc_inject":
+        return doc_ingest(
+            ctx,
+            path=str(args.get("path", "")),
+            key=(None if args.get("key") is None else str(args.get("key"))),
+            title=(None if args.get("title") is None else str(args.get("title"))),
+            replace=bool(args.get("replace", True)),
+            max_chars=int(args.get("max_chars", 200000)),
+        )
+    if name == "doc_search":
+        return doc_search(
+            ctx,
+            query=str(args.get("query", "")),
+            limit=int(args.get("limit", 5)),
+        )
+    if name == "doc_get":
+        return doc_get(
+            ctx,
+            id=(None if args.get("id") is None else int(args.get("id"))),
+            key=(None if args.get("key") is None else str(args.get("key"))),
+            include_content=bool(args.get("include_content", True)),
+            max_chars=int(args.get("max_chars", 8000)),
+        )
+    if name == "doc_list":
+        return doc_list(
+            ctx,
+            limit=int(args.get("limit", 20)),
+            offset=int(args.get("offset", 0)),
+            query=(None if args.get("query") is None else str(args.get("query"))),
+        )
+    if name == "doc_delete":
+        return doc_delete(
             ctx,
             id=(None if args.get("id") is None else int(args.get("id"))),
             key=(None if args.get("key") is None else str(args.get("key"))),

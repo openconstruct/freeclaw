@@ -13,6 +13,13 @@ def _default_config_dir() -> Path:
     return _default_memory_db_path().parent.resolve()
 
 
+def _is_fs_root(p: Path) -> bool:
+    try:
+        return p == Path(p.anchor)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class ToolContext:
     root: Path
@@ -84,6 +91,10 @@ class ToolContext:
             ws = (Path.cwd() / ws).resolve()
         else:
             ws = ws.resolve()
+        # Safety: never allow workspace to become filesystem root.
+        # This prevents state dirs like /.freeclaw from being created.
+        if _is_fs_root(ws):
+            ws = (Path.cwd() / "workspace").resolve()
 
         # Default custom tools dir lives under workspace to keep specs/state separate from disk access root.
         ctd = (
