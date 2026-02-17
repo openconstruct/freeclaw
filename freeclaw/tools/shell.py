@@ -47,6 +47,8 @@ def _clean_env() -> dict[str, str]:
         "GROQ_KEY",
         "DISCORD_BOT_TOKEN",
         "FREECLAW_DISCORD_TOKEN",
+        "FREECLAW_TIMER_DISCORD_BOT_TOKEN",
+        "FREECLAW_TIMER_DISCORD_WEBHOOK_URL",
     ]:
         env.pop(k, None)
     return env

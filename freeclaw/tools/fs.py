@@ -5,14 +5,6 @@ from pathlib import Path
 from typing import Any
 import shutil
 
-from ..paths import memory_db_path as _default_memory_db_path
-
-
-def _default_config_dir() -> Path:
-    # Back-compat: keep helper name, but config is local by default.
-    return _default_memory_db_path().parent.resolve()
-
-
 def _is_fs_root(p: Path) -> bool:
     try:
         return p == Path(p.anchor)

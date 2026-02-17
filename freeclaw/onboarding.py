@@ -13,11 +13,26 @@ from .agents import (
 )
 from .config import ClawConfig, default_skills_dir, load_config_dict, save_config_dict
 from .dotenv import default_config_env_path, set_env_var
+from .google_guide import google_md_text
 from .http_client import get_json
 from .providers.groq import fetch_models as groq_fetch_models
 from .providers.groq import model_ids as groq_model_ids
 from .providers.openrouter import fetch_models as openrouter_fetch_models
 from .providers.openrouter import model_ids as openrouter_model_ids
+
+
+def _google_oauth_defaults_from_env() -> tuple[str, str, str, str, str]:
+    client_id = (os.getenv("FREECLAW_GOOGLE_CLIENT_ID") or os.getenv("GAUTH_GOOGLE_CLIENT_ID") or "").strip()
+    client_secret = (os.getenv("FREECLAW_GOOGLE_CLIENT_SECRET") or os.getenv("GAUTH_GOOGLE_CLIENT_SECRET") or "").strip()
+    redirect_uri = (os.getenv("FREECLAW_GOOGLE_REDIRECT_URI") or os.getenv("GAUTH_GOOGLE_REDIRECT_URI") or "").strip()
+    if not redirect_uri:
+        redirect_uri = "http://<PUBLIC_IP>:3000/v1/oauth/callback"
+    default_scopes = (
+        os.getenv("FREECLAW_GOOGLE_DEFAULT_SCOPES")
+        or "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly openid email"
+    ).strip()
+    timeout_s = (os.getenv("FREECLAW_GOOGLE_OAUTH_TIMEOUT_S") or "20.0").strip() or "20.0"
+    return client_id, client_secret, redirect_uri, default_scopes, timeout_s
 
 
 def _prompt(msg: str, default: str | None = None) -> str:
@@ -308,6 +323,7 @@ def _write_startup_md(
             "## Task Timer",
             f"- Interval minutes: {int(task_timer_minutes)}",
             "- Tasks file: tasks.md",
+            "- Timer process is shared across bots; start it separately once from CLI.",
             "",
             "## Discord Behavior",
             f"- Prefix: {discord_prefix}",
@@ -403,7 +419,7 @@ def _ensure_tools_md(*, path: Path) -> None:
     memory = sorted([n for n in names if n.startswith("memory_")])
     task = sorted([n for n in names if n.startswith("task_")])
     docs = sorted([n for n in names if n.startswith("doc_")])
-    web = [n for n in ["text_search", "web_search", "web_fetch", "http_request_json"] if n in names]
+    web = [n for n in ["text_search", "web_search", "web_fetch", "http_request_json", "timer_api_get"] if n in names]
     shell = ["sh_exec"] if "sh_exec" in names else []
 
     txt = "\n".join(
@@ -446,6 +462,7 @@ def _ensure_tools_md(*, path: Path) -> None:
             "",
             "## Notes",
             "- Prefer the right family first: fs_*, task_*, doc_*, memory_*, web/http, shell.",
+            "- `timer_api_get` is for local timer-api reads (`system_metrics`, `status`, `health`) on localhost only.",
             "- If needed, refer to live tool schemas in runtime for full parameters.",
             "",
         ]
@@ -477,12 +494,16 @@ def _ensure_tasks_md(*, path: Path, task_timer_minutes: int) -> None:
             "- The agent will be told which tasks are due (with elapsed minutes).",
             "",
             "## Tasks",
-            "1440-Save an .md memory file to memory",
+            "1440-Journal your activites for today in a dated .md file in the Journal directory",
             "<!-- Add tasks below -->",
             "",
         ]
     )
     path.write_text(txt + "\n", encoding="utf-8")
+
+
+def _ensure_journal_dir(*, path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_once_md(*, path: Path) -> None:
@@ -520,6 +541,13 @@ def _ensure_once_md(*, path: Path) -> None:
         ]
     )
     path.write_text(txt + "\n", encoding="utf-8")
+
+
+def _ensure_google_md(*, path: Path) -> None:
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(google_md_text(), encoding="utf-8")
 
 
 def _select_env_path(hint: Path | None) -> Path:
@@ -686,6 +714,15 @@ def run_onboarding(
     mem_root = (workspace_p / "mem").resolve()
     mem_root.mkdir(parents=True, exist_ok=True)
     set_env_var(env_path, "FREECLAW_MEMORY_DB", str(mem_root / "memory.sqlite3"))
+    google_client_id, google_client_secret, google_redirect_uri, google_default_scopes, google_timeout_s = (
+        _google_oauth_defaults_from_env()
+    )
+    set_env_var(env_path, "FREECLAW_GOOGLE_CLIENT_ID", google_client_id)
+    set_env_var(env_path, "FREECLAW_GOOGLE_CLIENT_SECRET", google_client_secret)
+    set_env_var(env_path, "FREECLAW_GOOGLE_REDIRECT_URI", google_redirect_uri)
+    set_env_var(env_path, "FREECLAW_GOOGLE_DEFAULT_SCOPES", google_default_scopes)
+    set_env_var(env_path, "FREECLAW_GOOGLE_OAUTH_TIMEOUT_S", google_timeout_s)
+    set_env_var(env_path, "FREECLAW_GOOGLE_CONNECT_EXPIRES_S", "900")
 
     # Default tool_root to where onboarding is run (typically your project directory).
     default_tool_root = str(Path.cwd().resolve())
@@ -728,7 +765,9 @@ def run_onboarding(
     )
     _ensure_tools_md(path=(workspace_p / "tools.md"))
     _ensure_tasks_md(path=(workspace_p / "tasks.md"), task_timer_minutes=task_timer_minutes)
+    _ensure_journal_dir(path=(workspace_p / "Journal"))
     _ensure_once_md(path=(workspace_p / "once.md"))
+    _ensure_google_md(path=(workspace_p / "google.md"))
 
     # Skills: create a default global skills dir and add it to config.
     skills_dir = default_skills_dir()
@@ -797,6 +836,7 @@ def run_onboarding(
     print(f"- persona {workspace_p / 'persona.md'}")
     print(f"- tools   {workspace_p / 'tools.md'}")
     print(f"- tasks   {workspace_p / 'tasks.md'}")
+    print(f"- google  {workspace_p / 'google.md'}")
     print(f"- task timer minutes: {int(task_timer_minutes)}")
     print(
         f"- web ui: {'enabled' if web_ui_enabled else 'disabled'}"
@@ -814,6 +854,7 @@ def run_onboarding(
         print("\nNote: also enable Message Content Intent in the Discord Developer Portal (Bot tab).")
     print("\nNext:")
     print("- run:    python -m freeclaw run \"hello\"")
+    print("- timer:  python -m freeclaw timer-api")
     print("- discord (all agents):  python -m freeclaw discord")
     print("- discord (base only):   python -m freeclaw discord --no-all-agents")
 
@@ -1008,6 +1049,15 @@ def run_create_agent(
     mem_root = (workspace_p / "mem").resolve()
     mem_root.mkdir(parents=True, exist_ok=True)
     set_env_var(env_path, "FREECLAW_MEMORY_DB", str(mem_root / "memory.sqlite3"))
+    google_client_id, google_client_secret, google_redirect_uri, google_default_scopes, google_timeout_s = (
+        _google_oauth_defaults_from_env()
+    )
+    set_env_var(env_path, "FREECLAW_GOOGLE_CLIENT_ID", google_client_id)
+    set_env_var(env_path, "FREECLAW_GOOGLE_CLIENT_SECRET", google_client_secret)
+    set_env_var(env_path, "FREECLAW_GOOGLE_REDIRECT_URI", google_redirect_uri)
+    set_env_var(env_path, "FREECLAW_GOOGLE_DEFAULT_SCOPES", google_default_scopes)
+    set_env_var(env_path, "FREECLAW_GOOGLE_OAUTH_TIMEOUT_S", google_timeout_s)
+    set_env_var(env_path, "FREECLAW_GOOGLE_CONNECT_EXPIRES_S", "900")
 
     default_tool_root = (base_cfg.tool_root or "").strip()
     # Safer default: avoid carrying forward "/" from a previous agent/profile unless the user types it.
@@ -1051,7 +1101,9 @@ def run_create_agent(
     )
     _ensure_tools_md(path=(workspace_p / "tools.md"))
     _ensure_tasks_md(path=(workspace_p / "tasks.md"), task_timer_minutes=int(getattr(base_cfg, "task_timer_minutes", 30)))
+    _ensure_journal_dir(path=(workspace_p / "Journal"))
     _ensure_once_md(path=(workspace_p / "once.md"))
+    _ensure_google_md(path=(workspace_p / "google.md"))
 
     # Skills: keep them global (config/skills) but allow per-agent enable list.
     skills_p = default_skills_dir()
@@ -1116,6 +1168,7 @@ def run_create_agent(
     print(f"- env:    {env_path}")
     print(f"- workspace: {workspace_p}")
     print(f"- tool_root: {tool_root_p}")
+    print(f"- google: {workspace_p / 'google.md'}")
     if want_discord and discord_app_id:
         # Minimal perms: View Channel (1024) + Send Messages (2048) + Read Message History (65536)
         # With extras: + Embed Links (16384) + Attach Files (32768)

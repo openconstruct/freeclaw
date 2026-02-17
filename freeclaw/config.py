@@ -11,10 +11,6 @@ def _default_config_path() -> Path:
     return config_path()
 
 
-def default_config_path() -> Path:
-    return _default_config_path()
-
-
 def load_config_dict(path: str | None) -> tuple[Path, dict[str, Any]]:
     cfg_path = Path(path) if path else _default_config_path()
     if cfg_path.exists():

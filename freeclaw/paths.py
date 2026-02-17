@@ -31,4 +31,3 @@ def memory_db_path() -> Path:
 
 def skills_dir() -> Path:
     return (config_dir() / "skills").resolve()
-

@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from ..agent import run_agent
+from ..google_oauth import (
+    claim_google_oauth_tokens,
+    get_google_oauth_status,
+    google_redirect_uri_from_env,
+    start_google_oauth_flow,
+)
 from ..paths import config_dir as _config_dir
 from ..paths import memory_db_path as _default_memory_db_path
 from ..tools import ToolContext, tool_schemas
@@ -574,6 +580,7 @@ async def run_discord_bot(
 
     label = _safe_label(bot_label or "base")
     provider = _provider_name(client)
+    google_redirect_uri = (google_redirect_uri_from_env() or "").strip()
     pid = int(os.getpid())
     started_s = float(time.time())
     stats_lock = threading.Lock()
@@ -690,6 +697,24 @@ async def run_discord_bot(
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_discord_sessions_v2_updated_at ON discord_sessions_v2(updated_at);"
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS google_tokens_v1 (
+              bot_id INTEGER NOT NULL,
+              discord_user_id INTEGER NOT NULL,
+              account_email TEXT,
+              scope TEXT,
+              access_token TEXT,
+              refresh_token TEXT,
+              token_expires_at INTEGER,
+              updated_at INTEGER NOT NULL,
+              PRIMARY KEY(bot_id, discord_user_id)
+            );
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_google_tokens_v1_updated_at ON google_tokens_v1(updated_at);"
+        )
         con.commit()
 
     def _initial_messages() -> list[dict[str, Any]]:
@@ -706,6 +731,7 @@ async def run_discord_bot(
                 f"- `{p} new` start a new conversation (keeps settings)",
                 f"- `{p} reset` clear the per-channel/DM session (messages + settings)",
                 f"- `{p} help` show this help",
+                f"- `{p} google connect|poll [connect_id]|status|disconnect` Google link commands",
                 "",
                 "Slash commands:",
                 "- `/help` show this help",
@@ -719,6 +745,10 @@ async def run_discord_bot(
                 "- `/persona show` show persona",
                 "- `/persona set <content>` set persona",
                 "- `/memory search <query> [limit]` search saved memory",
+                "- `/google connect` start Google account link for this bot/user",
+                "- `/google poll [connect_id]` poll Google link status",
+                "- `/google status` show Google link for this bot/user",
+                "- `/google disconnect` unlink Google account for this bot/user",
                 "",
                 "Notes:",
                 "- Model/temp/tokens overrides persist per channel/DM across restarts.",
@@ -726,6 +756,192 @@ async def run_discord_bot(
                 "- Message attachments are parsed and included (PDF + common text/code formats).",
             ]
         )
+
+    pending_google_connect: dict[tuple[int, int], str] = {}
+
+    async def _google_connect_text(*, bot_id: int, user_id: int) -> str:
+        if db_path is None:
+            return "Google connect is unavailable: memory DB path is not configured."
+        try:
+            obj = await asyncio.to_thread(
+                start_google_oauth_flow,
+                db_path=str(db_path),
+                bot_id=bot_id,
+                discord_user_id=user_id,
+            )
+        except Exception as e:
+            guide_path = (ws / "google.md") if ws is not None else Path("workspace/google.md")
+            lines = [
+                "Google connect failed to start.",
+                f"- error: {type(e).__name__}: {e}",
+                f"- setup guide: {guide_path}",
+            ]
+            if not google_redirect_uri:
+                lines.append("- missing env: FREECLAW_GOOGLE_REDIRECT_URI")
+            return "\n".join(lines)
+
+        connect_id = str(obj.get("connect_id") or "").strip()
+        if connect_id:
+            pending_google_connect[(bot_id, user_id)] = connect_id
+        auth_url = str(obj.get("authorization_url") or "").strip()
+        redirect_uri = str(obj.get("redirect_uri") or google_redirect_uri or "").strip()
+        lines = [
+            "Google connect started for this bot/user.",
+            f"- authorization_url: {auth_url or '(missing)'}",
+            (f"- connect_id: {connect_id}" if connect_id else "- connect_id: (missing)"),
+            (f"- redirect_uri: {redirect_uri}" if redirect_uri else "- redirect_uri: (missing)"),
+            "",
+            "After approving in browser, run `/google poll` or `!claw google poll`.",
+        ]
+        return "\n".join(lines)
+
+    async def _google_poll_text(*, bot_id: int, user_id: int, connect_id: str | None = None) -> str:
+        if db_path is None:
+            return "Google connect is unavailable: memory DB path is not configured."
+        cid = (connect_id or "").strip()
+        if not cid:
+            cid = pending_google_connect.get((bot_id, user_id), "")
+        if not cid:
+            return "No pending connect_id. Run `/google connect` first (or pass connect_id)."
+        try:
+            obj = await asyncio.to_thread(
+                get_google_oauth_status,
+                db_path=str(db_path),
+                connect_id=cid,
+            )
+        except Exception as e:
+            return f"Google connect poll failed: {type(e).__name__}: {e}"
+
+        status = str(obj.get("status") or "unknown")
+        if status == "authorized":
+            try:
+                claim = await asyncio.to_thread(
+                    claim_google_oauth_tokens,
+                    db_path=str(db_path),
+                    connect_id=cid,
+                    bot_id=bot_id,
+                    discord_user_id=user_id,
+                )
+            except Exception as e:
+                return f"Google connect claim failed: {type(e).__name__}: {e}"
+            _google_token_upsert(
+                bot_id=bot_id,
+                discord_user_id=user_id,
+                account_email=(None if claim.get("account_email") is None else str(claim.get("account_email"))),
+                scope=str(claim.get("scope") or ""),
+                access_token=str(claim.get("access_token") or ""),
+                refresh_token=(None if claim.get("refresh_token") is None else str(claim.get("refresh_token"))),
+                token_expires_at=int(claim.get("token_expires_at") or 0),
+            )
+            pending_google_connect.pop((bot_id, user_id), None)
+            lines = [
+                "Google connect status: `authorized`",
+                f"- connect_id: {str(claim.get('connect_id') or cid)}",
+                f"- account_email: {str(claim.get('account_email') or '(not set)')}",
+                "- tokens: claimed and saved locally in Freeclaw DB",
+            ]
+            return "\n".join(lines)
+        if status in {"expired", "error", "claimed"}:
+            pending_google_connect.pop((bot_id, user_id), None)
+        lines = [
+            f"Google connect status: `{status}`",
+            f"- connect_id: {str(obj.get('connect_id') or cid)}",
+            f"- account_email: {str(obj.get('account_email') or '(not set)')}",
+            f"- error: {str(obj.get('error') or '(none)')}",
+        ]
+        return "\n".join(lines)
+
+    async def _google_status_text(*, bot_id: int, user_id: int) -> str:
+        tok = _google_token_get(bot_id=bot_id, discord_user_id=user_id)
+        if tok is None:
+            return "No Google account linked for this bot/user."
+        lines = [
+            "Google account linked for this bot/user.",
+            f"- account_email: {str(tok.get('account_email') or '(unknown)')}",
+            f"- scope: {str(tok.get('scope') or '(none)')}",
+            f"- token_expires_at: {str(tok.get('token_expires_at') or '(unknown)')}",
+        ]
+        return "\n".join(lines)
+
+    async def _google_disconnect_text(*, bot_id: int, user_id: int) -> str:
+        _google_token_delete(bot_id=bot_id, discord_user_id=user_id)
+        pending_google_connect.pop((bot_id, user_id), None)
+        return "Google account unlinked for this bot/user."
+
+    def _google_token_get(*, bot_id: int, discord_user_id: int) -> dict[str, Any] | None:
+        try:
+            with _db_connect() as con:
+                _init_session_schema(con)
+                row = con.execute(
+                    """
+                    SELECT account_email, scope, access_token, refresh_token, token_expires_at, updated_at
+                    FROM google_tokens_v1
+                    WHERE bot_id=? AND discord_user_id=?
+                    """,
+                    (int(bot_id), int(discord_user_id)),
+                ).fetchone()
+                if not row:
+                    return None
+                return {
+                    "account_email": row[0],
+                    "scope": row[1],
+                    "access_token": row[2],
+                    "refresh_token": row[3],
+                    "token_expires_at": row[4],
+                    "updated_at": row[5],
+                }
+        except Exception:
+            log.debug("failed to load google token", exc_info=True)
+            return None
+
+    def _google_token_upsert(
+        *,
+        bot_id: int,
+        discord_user_id: int,
+        account_email: str | None,
+        scope: str,
+        access_token: str,
+        refresh_token: str | None,
+        token_expires_at: int,
+    ) -> None:
+        now = int(time.time())
+        with _db_connect() as con:
+            _init_session_schema(con)
+            con.execute(
+                """
+                INSERT INTO google_tokens_v1 (
+                  bot_id, discord_user_id, account_email, scope,
+                  access_token, refresh_token, token_expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bot_id, discord_user_id) DO UPDATE SET
+                  account_email=excluded.account_email,
+                  scope=excluded.scope,
+                  access_token=excluded.access_token,
+                  refresh_token=excluded.refresh_token,
+                  token_expires_at=excluded.token_expires_at,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    int(bot_id),
+                    int(discord_user_id),
+                    account_email,
+                    str(scope or ""),
+                    str(access_token or ""),
+                    (None if refresh_token is None else str(refresh_token)),
+                    int(token_expires_at or 0),
+                    now,
+                ),
+            )
+            con.commit()
+
+    def _google_token_delete(*, bot_id: int, discord_user_id: int) -> None:
+        with _db_connect() as con:
+            _init_session_schema(con)
+            con.execute(
+                "DELETE FROM google_tokens_v1 WHERE bot_id=? AND discord_user_id=?",
+                (int(bot_id), int(discord_user_id)),
+            )
+            con.commit()
 
     def _load_session(*, bot_id: int, channel_id: int) -> DiscordSession | None:
         try:
@@ -877,6 +1093,7 @@ async def run_discord_bot(
         def __init__(self, *, intents: "discord.Intents") -> None:  # type: ignore[name-defined]
             super().__init__(intents=intents)
             self.tree = app_commands.CommandTree(self)
+            self._guild_synced = False
 
         async def setup_hook(self) -> None:
             try:
@@ -886,6 +1103,14 @@ async def run_discord_bot(
 
         async def on_ready(self) -> None:
             assert self.user is not None
+            if not self._guild_synced:
+                # Global sync can take time to propagate. Also sync per-guild for faster command availability.
+                for g in list(self.guilds):
+                    try:
+                        await self.tree.sync(guild=g)
+                    except Exception as e:
+                        log.warning("discord guild slash sync failed guild_id=%s: %s", int(getattr(g, "id", 0) or 0), e)
+                self._guild_synced = True
             log.info("freeclaw discord logged in as %s (id=%s)", self.user, self.user.id)
             log.info("prefix=%r respond_to_all=%s enable_tools=%s", prefix, bool(respond_to_all), bool(enable_tools))
             with stats_lock:
@@ -929,10 +1154,17 @@ async def run_discord_bot(
                 base_agent_msgs = [dict(m) for m in sess.messages]
                 # Expose Discord request context to the agent (not persisted in chat history).
                 if author_id is not None:
-                    meta = f"Discord request context (do not reveal unless asked): author_id={int(author_id)}"
+                    meta = (
+                        "Discord request context (do not reveal unless asked): "
+                        f"author_id={int(author_id)} discord_user_id={int(author_id)} bot_id={int(bot_id)}"
+                    )
                     if guild_id is not None:
                         meta += f" guild_id={int(guild_id)}"
                     meta += f" channel_id={int(channel_id)}"
+                    meta += (
+                        " For google_email_* and google_calendar_* tools, pass bot_id and discord_user_id "
+                        "from this context."
+                    )
                     insert_at = 1 if (base_agent_msgs and base_agent_msgs[0].get("role") == "system") else 0
                     base_agent_msgs.insert(insert_at, {"role": "system", "content": meta})
                     # Optional Discord auth reminder (once.md/user.md), not persisted in chat history.
@@ -1028,10 +1260,11 @@ async def run_discord_bot(
                 return _split_discord_message(text or "")
 
         async def on_message(self, message: "discord.Message") -> None:  # type: ignore[name-defined]
-            if message.author.bot:
+            assert self.user is not None
+            author_is_bot = bool(getattr(message.author, "bot", False))
+            if int(message.author.id) == int(self.user.id):
                 return
 
-            assert self.user is not None
             content = (message.content or "").strip()
             has_attachments = bool(getattr(message, "attachments", None))
             if not content and not has_attachments:
@@ -1051,35 +1284,39 @@ async def run_discord_bot(
                 triggered = True
                 explicit_cmd = True
                 prompt = _strip_bot_mention(content, self.user.id)
-            elif respond_to_all and (content or has_attachments):
+            elif respond_to_all and not author_is_bot and (content or has_attachments):
                 triggered = True
                 prompt = content
 
             # Optional Discord auth gate (enabled by workspace/once.md).
-            author_name = (
-                getattr(message.author, "display_name", None)
-                or getattr(message.author, "global_name", None)
-                or getattr(message.author, "name", None)
-            )
-            allowed, auth_id, auth_name, _just_set = _ensure_and_check_authorized_user(
-                ws,
-                author_id=int(message.author.id),
-                author_name=(str(author_name) if author_name is not None else None),
-            )
-            if not allowed:
-                if explicit_cmd:
-                    who = (auth_name.strip() if isinstance(auth_name, str) and auth_name.strip() else str(auth_id))
-                    await message.channel.send(
-                        f"Unauthorized. {who} is my user (author_id={int(auth_id) if auth_id is not None else 'unknown'})."
-                    )  # type: ignore[attr-defined]
-                return
+            # Keep this gate for human users, but allow bot-authored messages so
+            # multiple bots in a shared channel can interact.
+            if not author_is_bot:
+                author_name = (
+                    getattr(message.author, "display_name", None)
+                    or getattr(message.author, "global_name", None)
+                    or getattr(message.author, "name", None)
+                )
+                allowed, auth_id, auth_name, _just_set = _ensure_and_check_authorized_user(
+                    ws,
+                    author_id=int(message.author.id),
+                    author_name=(str(author_name) if author_name is not None else None),
+                )
+                if not allowed:
+                    if explicit_cmd:
+                        who = (auth_name.strip() if isinstance(auth_name, str) and auth_name.strip() else str(auth_id))
+                        await message.channel.send(
+                            f"Unauthorized. {who} is my user (author_id={int(auth_id) if auth_id is not None else 'unknown'})."
+                        )  # type: ignore[attr-defined]
+                    return
 
             if not triggered:
                 return
             log.debug(
-                "discord message trigger channel_id=%s author_id=%s explicit_cmd=%s attachments=%s",
+                "discord message trigger channel_id=%s author_id=%s author_is_bot=%s explicit_cmd=%s attachments=%s",
                 int(channel_id),
                 int(message.author.id),
+                bool(author_is_bot),
                 bool(explicit_cmd),
                 bool(has_attachments),
             )
@@ -1097,6 +1334,32 @@ async def run_discord_bot(
             if explicit_cmd and prompt.lower() in {"help", "commands", "?"}:
                 chunks = _split_discord_message(_help_text())
                 for ch in chunks:
+                    await message.channel.send(ch)  # type: ignore[attr-defined]
+                return
+
+            if explicit_cmd and prompt.lower().startswith("google"):
+                parts = [p for p in prompt.strip().split(" ") if p]
+                sub = parts[1].lower().strip() if len(parts) >= 2 else ""
+                bot_id = int(self.user.id)
+                user_id = int(message.author.id)
+                if sub not in {"connect", "poll", "status", "disconnect"}:
+                    await message.channel.send(
+                        f"Usage: `{prefix} google connect|poll [connect_id]|status|disconnect`"
+                    )  # type: ignore[attr-defined]
+                    return
+                try:
+                    if sub == "connect":
+                        text = await _google_connect_text(bot_id=bot_id, user_id=user_id)
+                    elif sub == "poll":
+                        cid = parts[2].strip() if len(parts) >= 3 else None
+                        text = await _google_poll_text(bot_id=bot_id, user_id=user_id, connect_id=cid)
+                    elif sub == "status":
+                        text = await _google_status_text(bot_id=bot_id, user_id=user_id)
+                    else:
+                        text = await _google_disconnect_text(bot_id=bot_id, user_id=user_id)
+                except Exception as e:
+                    text = f"Google command error: {e}"
+                for ch in _split_discord_message(text):
                     await message.channel.send(ch)  # type: ignore[attr-defined]
                 return
 
@@ -1428,8 +1691,70 @@ async def run_discord_bot(
         txt = "Memory results:\n" + "\n".join(lines)
         await interaction.response.send_message(txt)  # type: ignore[attr-defined]
 
+    google_group = app_commands.Group(
+        name="google",
+        description="Link this bot to your Google account via external auth server.",
+    )  # type: ignore[attr-defined]
+
+    @google_group.command(name="connect", description="Start Google web OAuth connect for this bot/user.")  # type: ignore[attr-defined]
+    async def google_connect_cmd(interaction: "discord.Interaction") -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        assert client_app.user is not None
+        bot_id = int(client_app.user.id)
+        user_id = int(interaction.user.id)
+        try:
+            text = await _google_connect_text(bot_id=bot_id, user_id=user_id)
+        except Exception as e:
+            await interaction.response.send_message(f"Google connect setup error: {e}", ephemeral=True)  # type: ignore[attr-defined]
+            return
+        await interaction.response.send_message(text, ephemeral=True)  # type: ignore[attr-defined]
+
+    @google_group.command(name="poll", description="Poll current Google connect flow status.")  # type: ignore[attr-defined]
+    async def google_poll_cmd(interaction: "discord.Interaction", connect_id: str | None = None) -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        assert client_app.user is not None
+        bot_id = int(client_app.user.id)
+        user_id = int(interaction.user.id)
+        try:
+            text = await _google_poll_text(bot_id=bot_id, user_id=user_id, connect_id=connect_id)
+        except Exception as e:
+            await interaction.response.send_message(f"Google poll error: {e}", ephemeral=True)  # type: ignore[attr-defined]
+            return
+        await interaction.response.send_message(text, ephemeral=True)  # type: ignore[attr-defined]
+
+    @google_group.command(name="status", description="Show linked Google account for this bot/user.")  # type: ignore[attr-defined]
+    async def google_status_cmd(interaction: "discord.Interaction") -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        assert client_app.user is not None
+        bot_id = int(client_app.user.id)
+        user_id = int(interaction.user.id)
+        try:
+            text = await _google_status_text(bot_id=bot_id, user_id=user_id)
+        except Exception as e:
+            await interaction.response.send_message(f"Google status error: {e}", ephemeral=True)  # type: ignore[attr-defined]
+            return
+        await interaction.response.send_message(text, ephemeral=True)  # type: ignore[attr-defined]
+
+    @google_group.command(name="disconnect", description="Unlink Google account for this bot/user.")  # type: ignore[attr-defined]
+    async def google_disconnect_cmd(interaction: "discord.Interaction") -> None:  # type: ignore[name-defined]
+        if not await _gate_interaction(interaction):
+            return
+        assert client_app.user is not None
+        bot_id = int(client_app.user.id)
+        user_id = int(interaction.user.id)
+        try:
+            text = await _google_disconnect_text(bot_id=bot_id, user_id=user_id)
+        except Exception as e:
+            await interaction.response.send_message(f"Google disconnect error: {e}", ephemeral=True)  # type: ignore[attr-defined]
+            return
+        await interaction.response.send_message(text, ephemeral=True)  # type: ignore[attr-defined]
+
     client_app.tree.add_command(mem_group)  # type: ignore[attr-defined]
     client_app.tree.add_command(persona_group)  # type: ignore[attr-defined]
+    client_app.tree.add_command(google_group)  # type: ignore[attr-defined]
 
     heartbeat_stop = asyncio.Event()
 

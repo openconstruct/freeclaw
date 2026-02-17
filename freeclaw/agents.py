@@ -38,10 +38,6 @@ def agent_env_path(name: str) -> Path:
     return agent_dir(name) / ".env"
 
 
-def agent_memory_db_path(name: str) -> Path:
-    return agent_dir(name) / "memory.sqlite3"
-
-
 def iter_agents() -> list[str]:
     base = agents_dir()
     if not base.exists() or not base.is_dir():

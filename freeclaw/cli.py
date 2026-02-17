@@ -1,21 +1,26 @@
 import argparse
 import asyncio
+import concurrent.futures
 import datetime as dt
+import ipaddress
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .agents import agent_config_path, agent_env_path, iter_agents, resolve_agent_name, validate_agent_name
 from .agent import run_agent
@@ -27,6 +32,12 @@ from .config import (
     write_default_config,
 )
 from .dotenv import autoload_dotenv, load_dotenv
+from .google_guide import google_md_text
+from .google_oauth import (
+    google_redirect_uri_from_env,
+    handle_google_oauth_callback,
+    oauth_state_exists,
+)
 from .http_client import get_json
 from .integrations.discord_bot import run_discord_bot
 from .logging_utils import setup_logging
@@ -78,6 +89,7 @@ _TASK_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+\[\s*([xX]?)\s*\]\s*(.*?
 # Task format: "<dotime>-<task>", where dotime is minutes between runs.
 _DOTIME_PREFIX_RE = re.compile(r"^\s*(\d{1,6})\s*-\s*(.+?)\s*$")
 _ISO_DATE_PREFIX_RE = re.compile(r"^\s*\d{4}-\d{2}-\d{2}(?:$|\s|T|:)", flags=0)
+_LOCALHOST_BINDS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 
 @dataclass(frozen=True)
@@ -111,8 +123,26 @@ class _TaskTimerRuntime:
     skills_block: str
     tool_root: Path
     workspace: Path
+    memory_db_path: Path
     minutes: int
     verbose_tools: bool
+    timer_discord_enabled: bool
+    timer_discord_channel_id: int | None
+    timer_discord_webhook_url: str | None
+    timer_discord_bot_token: str | None
+    timer_discord_timeout_s: float
+    timer_discord_context_enabled: bool
+    timer_discord_context_max_messages: int
+    timer_discord_context_max_chars: int
+
+
+@dataclass(frozen=True)
+class _TaskTimerTarget:
+    label: str
+    agent_name: str | None
+    config_path: Path
+    env_path: Path | None
+    runtime: _TaskTimerRuntime
 
 
 def _task_timer_state_path(workspace: Path) -> Path:
@@ -150,6 +180,608 @@ def _save_task_timer_last_run(path: Path, last_run: dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {"version": 1, "last_run": {str(k): int(v) for k, v in (last_run or {}).items()}}
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _env_truthy(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_url_for_log(url: str) -> str:
+    try:
+        u = urlsplit(url)
+        return urlunsplit((u.scheme, u.netloc, u.path, "", ""))
+    except Exception:
+        return str(url)
+
+
+def _url_with_wait_true(url: str) -> str:
+    try:
+        u = urlsplit(url)
+        q = dict(parse_qsl(u.query, keep_blank_values=True))
+        q["wait"] = "true"
+        return urlunsplit((u.scheme, u.netloc, u.path, urlencode(q), ""))
+    except Exception:
+        if "?" in str(url):
+            return f"{url}&wait=true"
+        return f"{url}?wait=true"
+
+
+def _truncate_discord_text(text: str, *, max_chars: int = 1900) -> str:
+    t = str(text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    tail = "\n...[truncated]"
+    keep = max(0, int(max_chars) - len(tail))
+    return (t[:keep].rstrip() + tail).strip()
+
+
+def _post_json_raw(
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout_s: float,
+) -> tuple[int, str]:
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    req = urllib.request.Request(url, method="POST", data=body)
+    for k, v in headers.items():
+        req.add_header(str(k), str(v))
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+        status = int(getattr(resp, "status", 200))
+        raw = resp.read(200_000)
+        return status, raw.decode("utf-8", errors="replace")
+
+
+def _task_timer_discord_mode(runtime: _TaskTimerRuntime) -> str:
+    if not runtime.timer_discord_enabled:
+        return "disabled"
+    if runtime.timer_discord_webhook_url:
+        return "webhook"
+    if runtime.timer_discord_channel_id is not None and runtime.timer_discord_bot_token:
+        return "channel"
+    return "disabled"
+
+
+def _task_timer_build_discord_summary(
+    runtime: _TaskTimerRuntime,
+    *,
+    now: str,
+    due_tasks: list[dict[str, Any]],
+    result_text: str,
+    steps: int,
+) -> str:
+    who = str(getattr(runtime.cfg, "assistant_name", "") or "").strip() or runtime.workspace.name
+    lines: list[str] = [
+        f"[timer] {who} ran {int(len(due_tasks))} due task(s) at {now}",
+        f"Workspace: {runtime.workspace}",
+    ]
+    if due_tasks:
+        lines.append("Due tasks:")
+        show = due_tasks[:8]
+        for d in show:
+            raw = str(d.get("raw") or d.get("task") or "").strip()
+            if not raw:
+                continue
+            lines.append(f"- {raw}")
+        if len(due_tasks) > len(show):
+            lines.append(f"- ... (+{int(len(due_tasks) - len(show))} more)")
+
+    lines.append(f"Tool steps: {int(steps)}")
+    txt = str(result_text or "").strip()
+    if txt:
+        lines += ["", "Summary:", txt]
+
+    return _truncate_discord_text("\n".join(lines), max_chars=1900)
+
+
+_TASK_TIMER_SOFT_FAILURE_PREFIXES = (
+    "[empty response from model",
+    "[tool call requested; tools disabled in empty-response recovery]",
+    "[tool call requested; tools disabled in this run]",
+    "[tool call requested; tool execution not implemented in freeclaw yet]",
+    "[max tool steps exceeded]",
+)
+
+
+def _task_timer_result_allows_last_run_advance(result_text: str) -> tuple[bool, str | None]:
+    txt = str(result_text or "").strip()
+    if not txt:
+        return False, "empty response text"
+    low = txt.lower()
+    for pref in _TASK_TIMER_SOFT_FAILURE_PREFIXES:
+        if low.startswith(pref):
+            return False, f"agent soft-failure output: {pref}"
+    return True, None
+
+
+def _task_timer_notify_discord(
+    runtime: _TaskTimerRuntime,
+    *,
+    content: str,
+) -> dict[str, Any]:
+    mode = _task_timer_discord_mode(runtime)
+    if mode == "disabled":
+        return {"ok": False, "sent": False, "mode": mode, "reason": "disabled"}
+
+    msg = _truncate_discord_text(content, max_chars=1900)
+    if not msg:
+        return {"ok": False, "sent": False, "mode": mode, "reason": "empty content"}
+
+    timeout_s = float(runtime.timer_discord_timeout_s)
+    if timeout_s <= 0:
+        timeout_s = 10.0
+
+    payload = {
+        "content": msg,
+        "allowed_mentions": {"parse": []},
+    }
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "freeclaw-timer/0.1",
+    }
+    post_url = ""
+    if mode == "webhook":
+        post_url = _url_with_wait_true(str(runtime.timer_discord_webhook_url or ""))
+    else:
+        post_url = f"https://discord.com/api/v10/channels/{int(runtime.timer_discord_channel_id or 0)}/messages"
+        headers["Authorization"] = f"Bot {str(runtime.timer_discord_bot_token or '').strip()}"
+
+    try:
+        status, raw_text = _post_json_raw(
+            url=post_url,
+            headers=headers,
+            payload=payload,
+            timeout_s=timeout_s,
+        )
+        msg_id = None
+        if raw_text.strip():
+            try:
+                obj = json.loads(raw_text)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                msg_id = obj.get("id")
+        return {
+            "ok": True,
+            "sent": True,
+            "mode": mode,
+            "status": int(status),
+            "url": _safe_url_for_log(post_url),
+            "message_id": (None if msg_id is None else str(msg_id)),
+        }
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read(4000).decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        return {
+            "ok": False,
+            "sent": False,
+            "mode": mode,
+            "status": int(getattr(e, "code", 0) or 0),
+            "url": _safe_url_for_log(post_url),
+            "error": f"HTTPError: {int(getattr(e, 'code', 0) or 0)}",
+            "body_preview": err_body[:300],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "sent": False,
+            "mode": mode,
+            "url": _safe_url_for_log(post_url),
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+def _safe_bot_label(s: str) -> str:
+    out: list[str] = []
+    for ch in (s or "").strip():
+        if ch.isalnum() or ch in {"-", "_"}:
+            out.append(ch)
+        elif ch.isspace():
+            out.append("-")
+    v = "".join(out).strip("-_")
+    return v[:80] if v else "base"
+
+
+def _resolve_timer_discord_bot_id_for_label(label: str) -> int | None:
+    bot_label = _safe_bot_label(label)
+    statuses = _read_active_bot_statuses(
+        now_s=float(time.time()),
+        active_within_s=30.0 * 86400.0,
+    )
+    bot_id: int | None = None
+    best_seen_s = -1.0
+    for st in statuses:
+        st_label = _safe_bot_label(str(st.get("bot_label") or ""))
+        if st_label != bot_label:
+            continue
+        try:
+            seen_s = float(st.get("last_seen_s", 0.0) or 0.0)
+        except Exception:
+            seen_s = 0.0
+        try:
+            did = int(st.get("discord_user_id"))
+        except Exception:
+            did = 0
+        if did <= 0:
+            continue
+        if seen_s >= best_seen_s:
+            best_seen_s = float(seen_s)
+            bot_id = int(did)
+    return bot_id
+
+
+def _resolve_timer_discord_channel_id_for_label(
+    label: str,
+    *,
+    workspace: Path | None = None,
+) -> int | None:
+    bot_id = _resolve_timer_discord_bot_id_for_label(label)
+    if bot_id is None:
+        return None
+
+    env_db = str(os.getenv("FREECLAW_MEMORY_DB") or "").strip()
+    candidates: list[Path] = []
+    if env_db:
+        candidates.append(Path(env_db).expanduser().resolve())
+    if workspace is not None:
+        candidates.append((Path(workspace) / "mem" / "memory.sqlite3").expanduser().resolve())
+    candidates.append((config_dir() / "memory.sqlite3").resolve())
+
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for p in candidates:
+        k = str(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        ordered.append(p)
+
+    for db_path in ordered:
+        if not db_path.exists() or not db_path.is_file():
+            continue
+        try:
+            con = sqlite3.connect(str(db_path))
+            try:
+                row = con.execute(
+                    """
+                    SELECT channel_id
+                    FROM discord_sessions_v2
+                    WHERE bot_id=?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (int(bot_id),),
+                ).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            continue
+
+        if not row:
+            continue
+        try:
+            cid = int(row[0])
+        except Exception:
+            continue
+        if cid > 0:
+            return int(cid)
+    return None
+
+
+def _task_timer_recent_discord_context(
+    runtime: _TaskTimerRuntime,
+    *,
+    max_messages: int,
+    max_chars: int,
+) -> dict[str, Any] | None:
+    max_messages_i = max(1, min(200, int(max_messages)))
+    max_chars_i = max(800, min(50_000, int(max_chars)))
+
+    db_path = _runtime_memory_db_path(runtime)
+    if not db_path.exists() or not db_path.is_file():
+        return None
+
+    label_hints: list[str] = []
+    a_name = str(getattr(runtime.cfg, "assistant_name", "") or "").strip()
+    if a_name:
+        label_hints.append(a_name)
+    ws_name = str(runtime.workspace.name or "").strip()
+    if ws_name:
+        label_hints.append(ws_name)
+    label_hints.append("base")
+
+    bot_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for lbl in label_hints:
+        bid = _resolve_timer_discord_bot_id_for_label(lbl)
+        if bid is None or bid <= 0 or bid in seen_ids:
+            continue
+        seen_ids.add(int(bid))
+        bot_ids.append(int(bid))
+
+    rows_to_try: list[tuple[str, tuple[Any, ...]]] = []
+    for bid in bot_ids:
+        rows_to_try.append(
+            (
+                """
+                SELECT bot_id, channel_id, messages_json, updated_at
+                FROM discord_sessions_v2
+                WHERE bot_id=?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (int(bid),),
+            )
+        )
+    rows_to_try.append(
+        (
+            """
+            SELECT bot_id, channel_id, messages_json, updated_at
+            FROM discord_sessions_v2
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (),
+        )
+    )
+
+    row: sqlite3.Row | None = None
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        try:
+            for sql, params in rows_to_try:
+                try:
+                    got = con.execute(sql, params).fetchone()
+                except Exception:
+                    continue
+                if got is not None:
+                    row = got
+                    break
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+    if row is None:
+        return None
+
+    raw = row["messages_json"]
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+
+    msgs_raw: list[Any] | None = None
+    if isinstance(obj, list):
+        msgs_raw = obj
+    elif isinstance(obj, dict):
+        m2 = obj.get("messages")
+        if isinstance(m2, list):
+            msgs_raw = m2
+    if not msgs_raw:
+        return None
+
+    items: list[tuple[str, str]] = []
+    for m in msgs_raw:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        txt = content.strip()
+        if not txt:
+            continue
+        items.append((role, txt))
+
+    if not items:
+        return None
+
+    items = items[-max_messages_i:]
+    lines: list[str] = [
+        "Recent Discord context from this bot's latest saved session:",
+        f"- channel_id: {int(row['channel_id'] or 0)}",
+        f"- updated_at_epoch: {int(row['updated_at'] or 0)}",
+        "- messages (oldest -> newest):",
+    ]
+
+    cur = len("\n".join(lines))
+    used_msgs = 0
+    for role, txt in items:
+        one_line = " ".join(txt.split())
+        if len(one_line) > 1500:
+            one_line = one_line[:1497].rstrip() + "..."
+        line = f"{role}: {one_line}"
+        add_len = len(line) + 1
+        if (cur + add_len) > max_chars_i:
+            lines.append("[discord context truncated]")
+            break
+        lines.append(line)
+        cur += add_len
+        used_msgs += 1
+
+    text = "\n".join(lines).strip()
+    if not text:
+        return None
+    return {
+        "text": text,
+        "channel_id": int(row["channel_id"] or 0),
+        "bot_id": int(row["bot_id"] or 0),
+        "updated_at": int(row["updated_at"] or 0),
+        "messages_included": int(used_msgs),
+        "db_path": str(db_path),
+    }
+
+
+def _task_timer_discord_tool_context(
+    runtime: _TaskTimerRuntime,
+    *,
+    discord_ctx: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    bot_id: int | None = None
+    discord_user_id: int | None = None
+    src_parts: list[str] = []
+
+    # Prefer bot identity from active runtime status, keyed by assistant/workspace labels.
+    label_hints: list[str] = []
+    a_name = str(getattr(runtime.cfg, "assistant_name", "") or "").strip()
+    if a_name:
+        label_hints.append(a_name)
+    ws_name = str(runtime.workspace.name or "").strip()
+    if ws_name:
+        label_hints.append(ws_name)
+    label_hints.append("base")
+
+    for lbl in label_hints:
+        bid = _resolve_timer_discord_bot_id_for_label(lbl)
+        if bid is not None and int(bid) > 0:
+            bot_id = int(bid)
+            src_parts.append("runtime_status")
+            break
+
+    # Fallback to latest discord session metadata when status files are stale/missing.
+    if bot_id is None and discord_ctx is not None:
+        try:
+            bid2 = int(discord_ctx.get("bot_id") or 0)
+        except Exception:
+            bid2 = 0
+        if bid2 > 0:
+            bot_id = int(bid2)
+            src_parts.append("discord_session")
+
+    # Preferred user identity source: workspace user.md binding.
+    user_txt = _read_user_md(runtime.workspace)
+    if user_txt:
+        uid, _ = _parse_user_md(user_txt)
+        if uid is not None and int(uid) > 0:
+            discord_user_id = int(uid)
+            src_parts.append("user_md")
+
+    # Fallback to google token rows in this runtime DB for any missing id.
+    db_path = _runtime_memory_db_path(runtime)
+    if db_path.exists() and db_path.is_file():
+        try:
+            con = sqlite3.connect(str(db_path))
+            con.row_factory = sqlite3.Row
+            try:
+                if bot_id is not None and discord_user_id is not None:
+                    ok_pair = con.execute(
+                        """
+                        SELECT 1
+                        FROM google_tokens_v1
+                        WHERE bot_id=? AND discord_user_id=?
+                        LIMIT 1
+                        """,
+                        (int(bot_id), int(discord_user_id)),
+                    ).fetchone()
+                    if ok_pair is None:
+                        row = con.execute(
+                            """
+                            SELECT discord_user_id
+                            FROM google_tokens_v1
+                            WHERE bot_id=?
+                            ORDER BY updated_at DESC
+                            LIMIT 1
+                            """,
+                            (int(bot_id),),
+                        ).fetchone()
+                        if row is not None:
+                            try:
+                                uid_fix = int(row["discord_user_id"] or 0)
+                            except Exception:
+                                uid_fix = 0
+                            if uid_fix > 0:
+                                discord_user_id = int(uid_fix)
+                                src_parts.append("google_tokens_v1_override")
+                elif bot_id is not None and discord_user_id is None:
+                    row = con.execute(
+                        """
+                        SELECT discord_user_id
+                        FROM google_tokens_v1
+                        WHERE bot_id=?
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (int(bot_id),),
+                    ).fetchone()
+                    if row is not None:
+                        try:
+                            uid2 = int(row["discord_user_id"] or 0)
+                        except Exception:
+                            uid2 = 0
+                        if uid2 > 0:
+                            discord_user_id = int(uid2)
+                            src_parts.append("google_tokens_v1")
+                elif bot_id is None and discord_user_id is not None:
+                    row = con.execute(
+                        """
+                        SELECT bot_id
+                        FROM google_tokens_v1
+                        WHERE discord_user_id=?
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (int(discord_user_id),),
+                    ).fetchone()
+                    if row is not None:
+                        try:
+                            bid3 = int(row["bot_id"] or 0)
+                        except Exception:
+                            bid3 = 0
+                        if bid3 > 0:
+                            bot_id = int(bid3)
+                            src_parts.append("google_tokens_v1")
+                elif bot_id is None and discord_user_id is None:
+                    row = con.execute(
+                        """
+                        SELECT bot_id, discord_user_id
+                        FROM google_tokens_v1
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if row is not None:
+                        try:
+                            bid4 = int(row["bot_id"] or 0)
+                        except Exception:
+                            bid4 = 0
+                        try:
+                            uid3 = int(row["discord_user_id"] or 0)
+                        except Exception:
+                            uid3 = 0
+                        if bid4 > 0 and uid3 > 0:
+                            bot_id = int(bid4)
+                            discord_user_id = int(uid3)
+                            src_parts.append("google_tokens_v1")
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    if bot_id is None or discord_user_id is None:
+        return None
+    if int(bot_id) <= 0 or int(discord_user_id) <= 0:
+        return None
+
+    src_join = ",".join(dict.fromkeys([s for s in src_parts if s])) or "unknown"
+    return {
+        "bot_id": int(bot_id),
+        "discord_user_id": int(discord_user_id),
+        "source": src_join,
+        "db_path": str(db_path),
+    }
 
 
 def _parse_task_line(line: str) -> _TaskItem | None:
@@ -301,6 +933,17 @@ def _resolve_workspace_root(cfg: ClawConfig, args_workspace: str | None) -> Path
     return ws
 
 
+def _validated_bind_host_or_die(host: str, *, localhost_only: bool) -> str:
+    h = (host or "").strip()
+    if not h:
+        h = "127.0.0.1"
+    if localhost_only and h.lower() not in _LOCALHOST_BINDS:
+        raise SystemExit(
+            f"timer-api host must be localhost-only ({', '.join(sorted(_LOCALHOST_BINDS))}); got: {h!r}"
+        )
+    return h
+
+
 def _read_persona_md(workspace: Path) -> str | None:
     p = workspace / "persona.md"
     try:
@@ -428,7 +1071,7 @@ def _tool_list_system_for(*, tool_ctx: ToolContext | None, include_shell: bool) 
     memory = sorted([n for n in names if n.startswith("memory_")])
     task = sorted([n for n in names if n.startswith("task_")])
     docs = sorted([n for n in names if n.startswith("doc_")])
-    web = [n for n in ["text_search", "web_search", "web_fetch", "http_request_json"] if n in names]
+    web = [n for n in ["text_search", "web_search", "web_fetch", "http_request_json", "timer_api_get"] if n in names]
     shell = ["sh_exec"] if "sh_exec" in names else []
     lines.append(f"- fs_*: {', '.join(fs) if fs else '(unavailable)'}")
     lines.append(f"- search/web/http: {', '.join(web) if web else '(unavailable)'}")
@@ -503,28 +1146,27 @@ def _ensure_tasks_md(workspace: Path, cfg: ClawConfig) -> None:
     try:
         workspace.mkdir(parents=True, exist_ok=True)
         p.write_text(
-	            "\n".join(
-	                [
-	                    "# tasks",
-	                    "",
-	                    "This file is the task list for Freeclaw's task timer.",
-	                    "",
-	                    "## Format",
-                        "- Each enabled task is one line: `<minutes>-<task>`",
-                        "  - Example: `30-check weather` (runs about every 30 minutes).",
-                        "- `minutes` is the repeat interval (dotime) in minutes.",
-                        "- Disable a task by commenting it out: `# 30-check weather`",
-                        "- Log results under a task as Markdown bullet lines starting with `- `.",
-                        "  - This avoids log lines being misread as tasks.",
-	                    "",
-	                    "## How It Works",
-	                    f"- Interval minutes (config): {int(getattr(cfg, 'task_timer_minutes', 30))}",
-                        "- Every tick, the task timer checks which tasks are due (based on dotime + elapsed time since last run).",
-                        "- It runs only due tasks; it does NOT run everything every tick.",
-                        "- The agent will be told which tasks are due (with elapsed minutes).",
+            "\n".join(
+                [
+                    "# tasks",
+                    "",
+                    "This file is the task list for Freeclaw's task timer.",
+                    "",
+                    "## Format",
+                    "- Each enabled task is one line: `<minutes>-<task>`",
+                    "  - Example: `30-check weather` (runs about every 30 minutes).",
+                    "- `minutes` is the repeat interval (dotime) in minutes.",
+                    "- Disable a task by commenting it out: `# 30-check weather`",
+                    "- Keep this file as task definitions only (do not append runtime logs here).",
+                    "",
+                    "## How It Works",
+                    f"- Interval minutes (config): {int(getattr(cfg, 'task_timer_minutes', 30))}",
+                    "- Every tick, the task timer checks which tasks are due (based on dotime + elapsed time since last run).",
+                    "- It runs only due tasks; it does NOT run everything every tick.",
+                    "- The agent will be told which tasks are due (with elapsed minutes).",
                     "",
                     "## Tasks",
-                    "1440-Save an .md memory file to memory",
+                    "1440-Journal your activites for today in a dated .md file in the Journal directory",
                     "<!-- Add tasks below -->",
                     "",
                 ]
@@ -532,6 +1174,24 @@ def _ensure_tasks_md(workspace: Path, cfg: ClawConfig) -> None:
             + "\n",
             encoding="utf-8",
         )
+    except OSError:
+        return
+
+
+def _ensure_journal_dir(workspace: Path) -> None:
+    try:
+        (workspace / "Journal").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+
+def _ensure_google_md(workspace: Path) -> None:
+    p = workspace / "google.md"
+    if p.exists():
+        return
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        p.write_text(google_md_text(), encoding="utf-8")
     except OSError:
         return
 
@@ -567,6 +1227,8 @@ def _core_system_prelude(
     # Make sure the docs ship even if onboarding wasn't run.
     _ensure_persona_md(workspace, cfg)
     _ensure_tasks_md(workspace, cfg)
+    _ensure_journal_dir(workspace)
+    _ensure_google_md(workspace)
     if enable_tools:
         _ensure_tools_md(workspace, tool_ctx=tool_ctx, include_shell=include_shell)
 
@@ -582,8 +1244,17 @@ def _core_system_prelude(
                 "- Disable a task by commenting it out: `# 30-check weather`",
                 "- The task-timer tick only checks what is due; it does NOT run every task every tick.",
                 "- When running under the task-timer, you will be told which tasks are due (with elapsed minutes). Only run due tasks.",
-                "- Log results under a task as Markdown bullet lines starting with `- ` (so log lines are not misread as tasks).",
+                "- Keep tasks.md as task definitions only. Do not append execution logs to this file.",
                 "- If a task is blocked, add a brief note describing what is needed.",
+            ]
+        )
+    )
+    parts.append(
+        "\n".join(
+            [
+                "Google OAuth guide:",
+                f"- Setup instructions file: {workspace / 'google.md'}",
+                "- If Google tools are used, follow the exact redirect URI guidance in google.md.",
             ]
         )
     )
@@ -639,22 +1310,6 @@ def _client_from_config(cfg: ClawConfig) -> Any:
     if provider in {"groq"}:
         return GroqChatClient.from_config(cfg)
     raise SystemExit(f"Unknown provider: {cfg.provider!r} (expected 'nim', 'openrouter', or 'groq').")
-
-
-def _tasks_has_pending(path: Path) -> bool:
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return False
-    # Keep this bounded; if it's huge, just assume "pending" so the model can summarize/prune.
-    if len(data) > 200_000:
-        return True
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    for ln in lines:
-        it = _parse_task_line(ln)
-        if it is not None and not it.checked:
-            return True
-    return False
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -1114,12 +1769,13 @@ def _build_task_timer_runtime(args: argparse.Namespace) -> _TaskTimerRuntime:
     if not args.no_tools:
         tool_root = args.tool_root if args.tool_root is not None else cfg.tool_root
         workspace_dir = args.workspace if getattr(args, "workspace", None) is not None else cfg.workspace_dir
-        enable_shell = None
+        # Timer ticks should run with full tool capability by default.
+        enable_shell = True
         if getattr(args, "no_shell", False):
             enable_shell = False
         elif getattr(args, "enable_shell", False):
             enable_shell = True
-        enable_custom_tools = None
+        enable_custom_tools = True
         if getattr(args, "no_custom_tools", False):
             enable_custom_tools = False
         elif getattr(args, "enable_custom_tools", False):
@@ -1147,15 +1803,100 @@ def _build_task_timer_runtime(args: argparse.Namespace) -> _TaskTimerRuntime:
     skills_block = "" if args.no_skills else render_enabled_skills_system(cfg)
     tool_root_p = tool_ctx.root if tool_ctx is not None else _resolve_tool_root(cfg, args.tool_root)
     workspace_p = tool_ctx.workspace if tool_ctx is not None else _resolve_workspace_root(cfg, getattr(args, "workspace", None))
+    if tool_ctx is not None:
+        memory_db_p = Path(tool_ctx.memory_db_path).expanduser().resolve()
+    else:
+        env_db = str(os.getenv("FREECLAW_MEMORY_DB") or "").strip()
+        if env_db:
+            memory_db_p = Path(env_db).expanduser().resolve()
+        else:
+            memory_db_p = (config_dir() / "memory.sqlite3").resolve()
     minutes = args.minutes if args.minutes is not None else int(getattr(cfg, "task_timer_minutes", 30))
+    timer_discord_webhook_url = str(os.getenv("FREECLAW_TIMER_DISCORD_WEBHOOK_URL") or "").strip() or None
+    timer_discord_bot_token = (
+        str(
+            os.getenv("FREECLAW_TIMER_DISCORD_BOT_TOKEN")
+            or os.getenv("DISCORD_BOT_TOKEN")
+            or os.getenv("FREECLAW_DISCORD_TOKEN")
+            or ""
+        ).strip()
+        or None
+    )
+    timer_discord_channel_id: int | None = None
+    channel_raw = str(os.getenv("FREECLAW_TIMER_DISCORD_CHANNEL_ID") or "").strip()
+    if channel_raw:
+        try:
+            cid = int(channel_raw)
+            if cid > 0:
+                timer_discord_channel_id = int(cid)
+            else:
+                log.warning("invalid FREECLAW_TIMER_DISCORD_CHANNEL_ID (must be > 0): %r", channel_raw)
+        except Exception:
+            log.warning("invalid FREECLAW_TIMER_DISCORD_CHANNEL_ID (must be integer): %r", channel_raw)
+    if timer_discord_channel_id is None and timer_discord_bot_token is not None:
+        label_hint = str(getattr(cfg, "assistant_name", "") or "").strip() or "base"
+        guessed = _resolve_timer_discord_channel_id_for_label(
+            label_hint,
+            workspace=workspace_p,
+        )
+        if guessed is not None:
+            timer_discord_channel_id = int(guessed)
+            log.info(
+                "task runtime timer discord channel auto-detected label=%s channel_id=%d",
+                str(label_hint),
+                int(guessed),
+            )
+
+    timeout_raw = str(os.getenv("FREECLAW_TIMER_DISCORD_TIMEOUT_S") or "").strip()
+    try:
+        timer_discord_timeout_s = float(timeout_raw) if timeout_raw else 10.0
+    except Exception:
+        timer_discord_timeout_s = 10.0
+    if timer_discord_timeout_s <= 0:
+        timer_discord_timeout_s = 10.0
+
+    timer_discord_context_enabled = _env_truthy("FREECLAW_TIMER_DISCORD_CONTEXT", default=True)
+    ctx_msgs_raw = str(os.getenv("FREECLAW_TIMER_DISCORD_CONTEXT_MAX_MESSAGES") or "").strip()
+    try:
+        timer_discord_context_max_messages = int(ctx_msgs_raw) if ctx_msgs_raw else 24
+    except Exception:
+        timer_discord_context_max_messages = 24
+    if timer_discord_context_max_messages < 1:
+        timer_discord_context_max_messages = 1
+    if timer_discord_context_max_messages > 200:
+        timer_discord_context_max_messages = 200
+
+    ctx_chars_raw = str(os.getenv("FREECLAW_TIMER_DISCORD_CONTEXT_MAX_CHARS") or "").strip()
+    try:
+        timer_discord_context_max_chars = int(ctx_chars_raw) if ctx_chars_raw else 12_000
+    except Exception:
+        timer_discord_context_max_chars = 12_000
+    if timer_discord_context_max_chars < 800:
+        timer_discord_context_max_chars = 800
+    if timer_discord_context_max_chars > 50_000:
+        timer_discord_context_max_chars = 50_000
+
+    notify_requested = _env_truthy("FREECLAW_TIMER_DISCORD_NOTIFY", default=True)
+    has_channel_transport = (
+        timer_discord_channel_id is not None and timer_discord_bot_token is not None
+    )
+    timer_discord_enabled = bool(
+        notify_requested and (timer_discord_webhook_url is not None or has_channel_transport)
+    )
+    timer_discord_mode = "disabled"
+    if timer_discord_enabled:
+        timer_discord_mode = "webhook" if timer_discord_webhook_url is not None else "channel"
+
     log.info(
-        "task runtime provider=%s model=%s workspace=%s tool_root=%s tools=%s minutes=%d",
+        "task runtime provider=%s model=%s workspace=%s tool_root=%s tools=%s minutes=%d discord_notify=%s discord_ctx=%s",
         (cfg.provider or "nim"),
         (cfg.model or "auto"),
         str(workspace_p),
         str(tool_root_p),
         (not bool(args.no_tools)),
         int(minutes),
+        timer_discord_mode,
+        bool(timer_discord_context_enabled),
     )
 
     return _TaskTimerRuntime(
@@ -1172,9 +1913,120 @@ def _build_task_timer_runtime(args: argparse.Namespace) -> _TaskTimerRuntime:
         skills_block=skills_block,
         tool_root=tool_root_p,
         workspace=workspace_p,
+        memory_db_path=memory_db_p,
         minutes=int(minutes),
         verbose_tools=bool(getattr(args, "verbose_tools", False)),
+        timer_discord_enabled=bool(timer_discord_enabled),
+        timer_discord_channel_id=timer_discord_channel_id,
+        timer_discord_webhook_url=timer_discord_webhook_url,
+        timer_discord_bot_token=timer_discord_bot_token,
+        timer_discord_timeout_s=float(timer_discord_timeout_s),
+        timer_discord_context_enabled=bool(timer_discord_context_enabled),
+        timer_discord_context_max_messages=int(timer_discord_context_max_messages),
+        timer_discord_context_max_chars=int(timer_discord_context_max_chars),
     )
+
+
+def _clone_args_with_config(args: argparse.Namespace, *, config_path: str | None) -> argparse.Namespace:
+    ns = argparse.Namespace(**vars(args))
+    ns.config = config_path
+    return ns
+
+
+def _build_task_timer_runtime_from_env(
+    *,
+    args: argparse.Namespace,
+    config_path: str | None,
+    env_path: Path | None,
+    base_env: dict[str, str],
+    configure_logging: bool,
+) -> _TaskTimerRuntime:
+    os.environ.clear()
+    os.environ.update(base_env)
+    if env_path is not None and env_path.exists() and env_path.is_file():
+        load_dotenv(env_path, override=True)
+
+    ns = _clone_args_with_config(args, config_path=config_path)
+    if not configure_logging:
+        ns.log_level = None
+        ns.log_file = None
+        ns.log_format = None
+    return _build_task_timer_runtime(ns)
+
+
+def _build_task_timer_targets(args: argparse.Namespace) -> tuple[list[_TaskTimerTarget], bool]:
+    include_all_agents = bool(getattr(args, "all_agents", False))
+    if include_all_agents and getattr(args, "agent", None):
+        raise SystemExit("--all-agents cannot be combined with --agent.")
+
+    base_env = dict(os.environ)
+    targets: list[_TaskTimerTarget] = []
+    failures: list[str] = []
+    configured_logging = False
+
+    def _add_target(
+        *,
+        label: str,
+        agent_name: str | None,
+        config_path: Path,
+        env_path: Path | None,
+    ) -> None:
+        nonlocal configured_logging
+        try:
+            runtime = _build_task_timer_runtime_from_env(
+                args=args,
+                config_path=str(config_path),
+                env_path=env_path,
+                base_env=base_env,
+                configure_logging=(not configured_logging),
+            )
+            configured_logging = True
+        except Exception as e:
+            msg = (
+                f"label={label} config={config_path}: {type(e).__name__}: {e}"
+            )
+            failures.append(msg)
+            log.exception("timer-api runtime init failed (%s)", msg)
+            return
+        targets.append(
+            _TaskTimerTarget(
+                label=label,
+                agent_name=agent_name,
+                config_path=config_path,
+                env_path=env_path,
+                runtime=runtime,
+            )
+        )
+
+    base_cfg_path, _ = load_config_dict(getattr(args, "config", None))
+    _add_target(
+        label="base",
+        agent_name=None,
+        config_path=base_cfg_path,
+        env_path=(None if getattr(args, "env_file", None) is None else Path(str(args.env_file)).expanduser()),
+    )
+
+    if include_all_agents:
+        for name in iter_agents():
+            _add_target(
+                label=name,
+                agent_name=name,
+                config_path=agent_config_path(name),
+                env_path=agent_env_path(name),
+            )
+
+    # Restore the process env before entering timer loops.
+    os.environ.clear()
+    os.environ.update(base_env)
+
+    if not targets:
+        if failures:
+            raise SystemExit(
+                "Could not initialize any timer runtimes:\n- " + "\n- ".join(failures)
+            )
+        raise SystemExit("Could not initialize any timer runtimes.")
+
+    return targets, include_all_agents
 
 
 def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
@@ -1182,6 +2034,7 @@ def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
     now_s = int(time.time())
 
     _ensure_tasks_md(runtime.workspace, runtime.cfg)
+    _ensure_journal_dir(runtime.workspace)
     tasks_p = runtime.workspace / "tasks.md"
     if int(runtime.minutes) <= 0:
         return {
@@ -1251,32 +2104,90 @@ def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
 
+    discord_ctx: dict[str, Any] | None = None
+    if runtime.timer_discord_context_enabled:
+        discord_ctx = _task_timer_recent_discord_context(
+            runtime,
+            max_messages=int(runtime.timer_discord_context_max_messages),
+            max_chars=int(runtime.timer_discord_context_max_chars),
+        )
+    if discord_ctx is not None:
+        out["discord_context"] = {
+            "included": True,
+            "bot_id": int(discord_ctx.get("bot_id") or 0),
+            "channel_id": int(discord_ctx.get("channel_id") or 0),
+            "messages_included": int(discord_ctx.get("messages_included") or 0),
+            "updated_at": int(discord_ctx.get("updated_at") or 0),
+            "db_path": str(discord_ctx.get("db_path") or ""),
+        }
+    else:
+        out["discord_context"] = {"included": False}
+
+    discord_tool_ctx = _task_timer_discord_tool_context(runtime, discord_ctx=discord_ctx)
+    if discord_tool_ctx is not None:
+        out["discord_tool_context"] = {
+            "included": True,
+            "bot_id": int(discord_tool_ctx.get("bot_id") or 0),
+            "discord_user_id": int(discord_tool_ctx.get("discord_user_id") or 0),
+            "source": str(discord_tool_ctx.get("source") or "unknown"),
+            "db_path": str(discord_tool_ctx.get("db_path") or ""),
+        }
+    else:
+        out["discord_tool_context"] = {"included": False}
+
+    prompt_lines: list[str] = [
+        f"Task timer tick: {now}",
+        "",
+        "Task scheduling:",
+        f"- Task timer tick interval: {int(runtime.minutes)} minutes",
+        "- Task format: `<dotime>-<task>` where dotime is minutes between runs.",
+        "- Only run tasks listed under DUE TASKS below. Do not run other tasks in tasks.md.",
+        "",
+        "DUE TASKS:",
+        *due_lines,
+    ]
+    if discord_ctx is not None:
+        prompt_lines += [
+            "",
+            "DISCORD HISTORY CONTEXT:",
+            str(discord_ctx.get("text") or "").strip(),
+            "",
+            "Use this Discord context for continuity (for example daily journal progress).",
+            "Do not assume facts that are not present in the context.",
+        ]
+    if discord_tool_ctx is not None:
+        prompt_lines += [
+            "",
+            "DISCORD REQUEST CONTEXT (for tool arguments):",
+            f"- bot_id: {int(discord_tool_ctx.get('bot_id') or 0)}",
+            f"- discord_user_id: {int(discord_tool_ctx.get('discord_user_id') or 0)}",
+            "- For google_email_* and google_calendar_* tools, always pass these exact values.",
+        ]
+        if discord_ctx is not None:
+            try:
+                ccid = int(discord_ctx.get("channel_id") or 0)
+            except Exception:
+                ccid = 0
+            if ccid > 0:
+                prompt_lines.append(f"- channel_id: {int(ccid)}")
+    prompt_lines += [
+        "",
+        "Instructions:",
+        "- Execute each due task using tools as needed.",
+        "- Do not append execution logs to tasks.md. Keep tasks.md as task definitions only.",
+        "- Return a concise summary of what was done in your assistant response text.",
+        "- If you want to disable a task, comment it out (prefix with `#`).",
+        "- If a task is blocked, add a note describing what's needed.",
+        "",
+        f"Tasks file (workspace): {tasks_p}",
+        "",
+        "Begin.",
+    ]
+
     messages.append(
         {
             "role": "user",
-            "content": "\n".join(
-                [
-                    f"Task timer tick: {now}",
-                    "",
-                    "Task scheduling:",
-                    f"- Task timer tick interval: {int(runtime.minutes)} minutes",
-                    "- Task format: `<dotime>-<task>` where dotime is minutes between runs.",
-                    "- Only run tasks listed under DUE TASKS below. Do not run other tasks in tasks.md.",
-                    "",
-                    "DUE TASKS:",
-                    *due_lines,
-                    "",
-                    "Instructions:",
-                    "- Execute each due task using tools as needed.",
-                    "- Log results under each task in tasks.md as Markdown bullets starting with `- ` (timestamp + short note).",
-                    "- If you want to disable a task, comment it out (prefix with `#`).",
-                    "- If a task is blocked, add a note describing what's needed.",
-                    "",
-                    f"Tasks file (workspace): {tasks_p}",
-                    "",
-                    "Begin.",
-                ]
-            ),
+            "content": "\n".join(prompt_lines),
         }
     )
 
@@ -1292,23 +2203,64 @@ def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
         tools_builder=runtime.tools_builder,
     )
 
-    keys = {str(d.item.key) for d in due}
-    for k in keys:
-        last_run[str(k)] = int(now_s)
-    known = {str(it.key) for it in items}
-    last_run = {k: v for k, v in last_run.items() if k in known}
-    _save_task_timer_last_run(state_p, last_run)
+    result_text = str(result.text or "")
+    result_ok, result_err = _task_timer_result_allows_last_run_advance(result_text)
 
-    out["ran"] = True
-    out["result_text"] = result.text
+    if result_ok:
+        keys = {str(d.item.key) for d in due}
+        for k in keys:
+            last_run[str(k)] = int(now_s)
+        known = {str(it.key) for it in items}
+        last_run = {k: v for k, v in last_run.items() if k in known}
+        _save_task_timer_last_run(state_p, last_run)
+        out["ran"] = True
+    else:
+        out["ok"] = False
+        out["ran"] = False
+        out["error"] = str(result_err or "task run did not complete")
+        log.warning(
+            "task tick incomplete now=%s due=%d workspace=%s reason=%s",
+            now,
+            int(len(due)),
+            str(runtime.workspace),
+            str(result_err or "unknown"),
+        )
+
+    out["result_text"] = result_text
     out["steps"] = int(result.steps)
-    log.info(
-        "task tick executed now=%s due=%d steps=%d workspace=%s",
-        now,
-        int(len(due)),
-        int(result.steps),
-        str(runtime.workspace),
-    )
+    notify_payload: dict[str, Any] | None = None
+    if runtime.timer_discord_enabled and result_ok:
+        summary_text = _task_timer_build_discord_summary(
+            runtime,
+            now=now,
+            due_tasks=due_json,
+            result_text=result_text,
+            steps=int(result.steps),
+        )
+        notify_payload = _task_timer_notify_discord(runtime, content=summary_text)
+        out["discord_notify"] = notify_payload
+        if bool(notify_payload.get("sent", False)):
+            log.info(
+                "task tick discord notify sent mode=%s workspace=%s status=%s",
+                str(notify_payload.get("mode") or "unknown"),
+                str(runtime.workspace),
+                str(notify_payload.get("status") or ""),
+            )
+        else:
+            log.warning(
+                "task tick discord notify failed mode=%s workspace=%s error=%s",
+                str(notify_payload.get("mode") or "unknown"),
+                str(runtime.workspace),
+                str(notify_payload.get("error") or notify_payload.get("reason") or "unknown"),
+            )
+    if result_ok:
+        log.info(
+            "task tick executed now=%s due=%d steps=%d workspace=%s",
+            now,
+            int(len(due)),
+            int(result.steps),
+            str(runtime.workspace),
+        )
     return out
 
 
@@ -1348,6 +2300,8 @@ def _read_active_bot_statuses(*, now_s: float, active_within_s: float = 180.0) -
         return out
 
     cutoff = float(now_s - float(active_within_s))
+    # Deduplicate by bot label and keep the newest record.
+    by_label: dict[str, dict[str, Any]] = {}
     for p in files:
         txt = _safe_read_text(p, max_bytes=200_000)
         if not txt:
@@ -1364,7 +2318,18 @@ def _read_active_bot_statuses(*, now_s: float, active_within_s: float = 180.0) -
             last_seen_s = 0.0
         if last_seen_s < cutoff:
             continue
-        out.append(obj)
+        label = str(obj.get("bot_label") or "").strip() or "unknown"
+        cur = by_label.get(label)
+        if cur is None:
+            by_label[label] = obj
+            continue
+        try:
+            cur_seen = float(cur.get("last_seen_s", 0.0) or 0.0)
+        except Exception:
+            cur_seen = 0.0
+        if last_seen_s >= cur_seen:
+            by_label[label] = obj
+    out.extend(by_label.values())
     return out
 
 
@@ -1805,18 +2770,32 @@ const setFill = (id, pct) => {
   const p = Math.max(0, Math.min(100, Number(pct || 0)));
   el.style.width = `${p.toFixed(1)}%`;
 };
+const clearNode = (el) => {
+  while (el.firstChild) el.removeChild(el.firstChild);
+};
+const appendCell = (tr, value, opts = {}) => {
+  const td = document.createElement("td");
+  if (opts.mono) td.className = "mono";
+  if (opts.colspan != null) td.colSpan = Number(opts.colspan);
+  td.textContent = String(value ?? "-");
+  tr.appendChild(td);
+};
 const setRows = (tblId, rows) => {
   const tb = document.querySelector(`#${tblId} tbody`);
-  tb.innerHTML = "";
+  clearNode(tb);
   for (const r of (rows || []).slice(0,8)) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td class="mono">${r.pid ?? "-"}</td><td>${r.name ?? "-"}</td><td>${(r.cpu_pct ?? 0).toFixed(1)}</td><td>${(r.mem_pct ?? 0).toFixed(1)}</td><td>${fmtBytes((r.rss_kb ?? 0)*1024)}</td>`;
+    appendCell(tr, r.pid ?? "-", { mono: true });
+    appendCell(tr, r.name ?? "-");
+    appendCell(tr, (r.cpu_pct ?? 0).toFixed(1));
+    appendCell(tr, (r.mem_pct ?? 0).toFixed(1));
+    appendCell(tr, fmtBytes((r.rss_kb ?? 0) * 1024));
     tb.appendChild(tr);
   }
 };
 const setBotRows = (rows) => {
   const tb = document.querySelector("#tbl_bots tbody");
-  tb.innerHTML = "";
+  clearNode(tb);
   const fmtAgo = (s) => {
     if (s == null || isNaN(s)) return "-";
     const d = Math.max(0, Math.floor((Date.now()/1000) - Number(s)));
@@ -1828,13 +2807,20 @@ const setBotRows = (rows) => {
   const list = (rows || []).slice(0, 20);
   if (!list.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td colspan="8">No active bot status detected yet.</td>`;
+    appendCell(tr, "No active bot status detected yet.", { colspan: 8 });
     tb.appendChild(tr);
     return;
   }
   for (const r of list) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${r.bot_label ?? "-"}</td><td>${r.provider ?? "-"}</td><td class="mono">${r.model ?? "-"}</td><td>${r.requests ?? 0}</td><td>${r.total_tokens_live ?? 0}</td><td>${r.total_tokens_24h ?? 0}</td><td>${r.total_tokens_7d ?? 0}</td><td>${fmtAgo(r.last_seen_s)}</td>`;
+    appendCell(tr, r.bot_label ?? "-");
+    appendCell(tr, r.provider ?? "-");
+    appendCell(tr, r.model ?? "-", { mono: true });
+    appendCell(tr, r.requests ?? 0);
+    appendCell(tr, r.total_tokens_live ?? 0);
+    appendCell(tr, r.total_tokens_24h ?? 0);
+    appendCell(tr, r.total_tokens_7d ?? 0);
+    appendCell(tr, fmtAgo(r.last_seen_s));
     tb.appendChild(tr);
   }
 };
@@ -1883,33 +2869,151 @@ setInterval(refresh, 2000);
 """
 
 
-def cmd_timer_api(args: argparse.Namespace) -> int:
-    runtime = _build_task_timer_runtime(args)
+def _timer_target_meta(target: _TaskTimerTarget) -> dict[str, Any]:
+    runtime = target.runtime
+    return {
+        "label": str(target.label),
+        "agent_name": target.agent_name,
+        "config_path": str(target.config_path),
+        "env_path": (None if target.env_path is None else str(target.env_path)),
+        "workspace": str(runtime.workspace),
+        "memory_db_path": str(runtime.memory_db_path),
+        "tasks_path": str(runtime.workspace / "tasks.md"),
+        "state_path": str(_task_timer_state_path(runtime.workspace)),
+        "interval_minutes": int(runtime.minutes),
+    }
 
-    host = str(getattr(args, "host", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1"
+
+def _runtime_memory_db_path(runtime: _TaskTimerRuntime) -> Path:
+    try:
+        return Path(runtime.memory_db_path).expanduser().resolve()
+    except Exception:
+        return (config_dir() / "memory.sqlite3").resolve()
+
+
+def _oauth_callback_db_paths(targets: list[_TaskTimerTarget]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for t in targets:
+        p = _runtime_memory_db_path(t.runtime)
+        k = str(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+    if out:
+        return out
+    return [(config_dir() / "memory.sqlite3").resolve()]
+
+
+def _task_timer_tick_batch(targets: list[_TaskTimerTarget]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    total_due = 0
+    total_enabled = 0
+    ran_any = False
+    failed_targets = 0
+
+    for target in targets:
+        runtime = target.runtime
+        try:
+            tick = _task_timer_tick(runtime)
+        except Exception as e:
+            failed_targets += 1
+            log.exception(
+                "task tick failed label=%s agent=%s workspace=%s",
+                str(target.label),
+                str(target.agent_name or ""),
+                str(runtime.workspace),
+            )
+            tick = {
+                "ok": False,
+                "now": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "ran": False,
+                "error": f"{type(e).__name__}: {e}",
+                "tasks_path": str(runtime.workspace / "tasks.md"),
+                "state_path": str(_task_timer_state_path(runtime.workspace)),
+                "summary": {"total": 0, "enabled": 0, "due": 0},
+                "enabled": 0,
+                "due_count": 0,
+                "due_tasks": [],
+            }
+
+        due_count = int(tick.get("due_count", 0) or 0)
+        enabled = int(tick.get("enabled", 0) or 0)
+        total_due += due_count
+        total_enabled += enabled
+        ran_any = ran_any or bool(tick.get("ran", False))
+
+        row = _timer_target_meta(target)
+        row["tick"] = tick
+        rows.append(row)
+
+    return {
+        "ok": (failed_targets == 0),
+        "mode": "all_agents",
+        "target_count": int(len(rows)),
+        "failed_targets": int(failed_targets),
+        "ran": bool(ran_any),
+        "enabled": int(total_enabled),
+        "due_count": int(total_due),
+        "targets": rows,
+        "summary": {
+            "targets": int(len(rows)),
+            "enabled": int(total_enabled),
+            "due": int(total_due),
+            "failed": int(failed_targets),
+        },
+    }
+
+
+def cmd_timer_api(args: argparse.Namespace) -> int:
+    targets, include_all_agents = _build_task_timer_targets(args)
+    runtime = targets[0].runtime
+    oauth_db_paths = _oauth_callback_db_paths(targets)
+    google_redirect_uri = google_redirect_uri_from_env()
+
+    localhost_only_bind = bool(getattr(args, "localhost_only_host", False))
+    host = _validated_bind_host_or_die(
+        str(getattr(args, "host", "0.0.0.0") or "0.0.0.0"),
+        localhost_only=localhost_only_bind,
+    )
     default_port = int(getattr(runtime.cfg, "web_ui_port", 3000) or 3000)
     port = int(getattr(args, "port", None) or default_port)
-    poll_seconds = float(getattr(args, "poll_seconds", 15.0) or 15.0)
+    poll_seconds = float(getattr(args, "poll_seconds", 300.0) or 300.0)
     if poll_seconds <= 0:
-        poll_seconds = 15.0
+        poll_seconds = 300.0
+    tick_timeout_default_s = 120.0 * float(max(1, len(targets)))
+    tick_timeout_s = float(os.getenv("FREECLAW_TIMER_TICK_TIMEOUT_S") or str(tick_timeout_default_s))
+    if tick_timeout_s <= 0:
+        tick_timeout_s = tick_timeout_default_s
     web_ui_enabled = (
         bool(getattr(runtime.cfg, "web_ui_enabled", True))
         if getattr(args, "web_ui", None) is None
         else bool(getattr(args, "web_ui", False))
     )
     log.info(
-        "timer-api start host=%s port=%d poll_seconds=%.1f web_ui=%s workspace=%s minutes=%d",
+        "timer-api start host=%s port=%d poll_seconds=%.1f web_ui=%s mode=%s targets=%d primary_workspace=%s",
         host,
         int(port),
         float(poll_seconds),
         bool(web_ui_enabled),
+        ("all-agents" if include_all_agents else "single"),
+        int(len(targets)),
         str(runtime.workspace),
-        int(runtime.minutes),
+    )
+    log.info(
+        "timer-api google oauth callback redirect_uri=%s db_paths=%s",
+        (google_redirect_uri or "(not set)"),
+        ",".join([str(p) for p in oauth_db_paths]),
     )
 
     state_lock = threading.Lock()
     tick_lock = threading.Lock()
     stop_event = threading.Event()
+    tick_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="freeclaw-timer-tick")
+    tick_future: concurrent.futures.Future[dict[str, Any]] | None = None
+    tick_started_s: float | None = None
+    tick_trigger: str | None = None
     metrics_state: dict[str, Any] = {"server_started_s": float(time.time())}
     enabled = {"value": True}
     status: dict[str, Any] = {
@@ -1919,40 +3023,103 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
         "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
+    def _submit_tick_job() -> concurrent.futures.Future[dict[str, Any]]:
+        if len(targets) == 1:
+            return tick_pool.submit(_task_timer_tick, targets[0].runtime)
+        return tick_pool.submit(_task_timer_tick_batch, targets)
+
     def _do_tick(trigger: str) -> tuple[int, dict[str, Any]]:
+        nonlocal tick_future, tick_started_s, tick_trigger
+
         with tick_lock:
-            try:
-                res = _task_timer_tick(runtime)
-                log.info(
-                    "timer-api tick trigger=%s ran=%s due=%s",
-                    str(trigger),
-                    bool(res.get("ran", False)),
-                    int(res.get("due_count", 0) or 0),
-                )
-                payload = {
-                    "ok": True,
-                    "trigger": str(trigger),
-                    "enabled": bool(enabled["value"]),
-                    "poll_seconds": float(poll_seconds),
-                    "interval_minutes": int(runtime.minutes),
-                    "tick": res,
-                }
-                with state_lock:
-                    status["last_tick_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-                    status["last_result"] = payload
-                    status["last_error"] = None
-                return 200, payload
-            except Exception as e:
-                log.exception("timer-api tick failed (trigger=%s)", trigger)
+            if tick_future is not None and not tick_future.done():
+                running_s = max(0.0, float(time.time()) - float(tick_started_s or time.time()))
                 payload = {
                     "ok": False,
                     "trigger": str(trigger),
-                    "error": f"{type(e).__name__}: {e}",
+                    "error": "tick already running",
+                    "running_for_s": round(running_s, 1),
+                    "running_trigger": str(tick_trigger or "unknown"),
                 }
-                with state_lock:
-                    status["last_tick_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-                    status["last_error"] = payload["error"]
-                return 500, payload
+                return 409, payload
+
+            tick_trigger = str(trigger)
+            tick_started_s = float(time.time())
+            tick_future = _submit_tick_job()
+            fut = tick_future
+
+        try:
+            res = fut.result(timeout=float(tick_timeout_s))
+        except concurrent.futures.TimeoutError:
+            running_s = max(0.0, float(time.time()) - float(tick_started_s or time.time()))
+            payload = {
+                "ok": False,
+                "trigger": str(trigger),
+                "error": f"tick timeout after {float(tick_timeout_s):.1f}s",
+                "running_for_s": round(running_s, 1),
+            }
+            log.error(
+                "timer-api tick timeout trigger=%s running_for_s=%.1f timeout_s=%.1f targets=%d",
+                str(trigger),
+                float(running_s),
+                float(tick_timeout_s),
+                int(len(targets)),
+            )
+            with state_lock:
+                status["last_tick_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                status["last_error"] = payload["error"]
+            return 504, payload
+        except Exception as e:
+            log.exception("timer-api tick failed (trigger=%s)", trigger)
+            with tick_lock:
+                tick_future = None
+                tick_started_s = None
+                tick_trigger = None
+            payload = {
+                "ok": False,
+                "trigger": str(trigger),
+                "error": f"{type(e).__name__}: {e}",
+            }
+            with state_lock:
+                status["last_tick_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+                status["last_error"] = payload["error"]
+            return 500, payload
+
+        with tick_lock:
+            tick_future = None
+            tick_started_s = None
+            tick_trigger = None
+
+        failed_targets = int(res.get("failed_targets", 0) or 0)
+        payload = {
+            "ok": bool(res.get("ok", True)),
+            "trigger": str(trigger),
+            "enabled": bool(enabled["value"]),
+            "poll_seconds": float(poll_seconds),
+            "interval_minutes": int(runtime.minutes),
+            "target_count": int(len(targets)),
+            "tick": res,
+        }
+        if include_all_agents:
+            payload["mode"] = "all_agents"
+
+        log.info(
+            "timer-api tick trigger=%s mode=%s ran=%s due=%s failed_targets=%d",
+            str(trigger),
+            ("all-agents" if include_all_agents else "single"),
+            bool(res.get("ran", False)),
+            int(res.get("due_count", 0) or 0),
+            int(failed_targets),
+        )
+        with state_lock:
+            status["last_tick_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            status["last_result"] = payload
+            status["last_error"] = (
+                None
+                if bool(payload.get("ok", False))
+                else "one or more timer targets failed"
+            )
+        return 200, payload
 
     def _auto_loop() -> None:
         while not stop_event.is_set():
@@ -1996,8 +3163,50 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
             self.end_headers()
             self.wfile.write(b)
 
+        def _client_is_local(self) -> bool:
+            ip_s = ""
+            try:
+                ip_s = str((self.client_address or ("", 0))[0] or "").strip()
+            except Exception:
+                return False
+            if not ip_s:
+                return False
+            if ip_s in {"127.0.0.1", "::1"}:
+                return True
+            try:
+                return bool(ipaddress.ip_address(ip_s).is_loopback)
+            except Exception:
+                return False
+
         def do_GET(self) -> None:  # noqa: N802
-            p = urlparse(self.path).path
+            up = urlparse(self.path)
+            p = up.path
+            if p == "/v1/oauth/callback":
+                q = dict(parse_qsl(up.query, keep_blank_values=True))
+                state = str(q.get("state") or "").strip()
+                code = str(q.get("code") or "").strip() or None
+                err = str(q.get("error") or "").strip() or None
+                err_desc = str(q.get("error_description") or "").strip() or None
+
+                selected_db = oauth_db_paths[0]
+                if state:
+                    for cand in oauth_db_paths:
+                        try:
+                            if oauth_state_exists(db_path=str(cand), state=state):
+                                selected_db = cand
+                                break
+                        except Exception:
+                            continue
+
+                status_code, body = handle_google_oauth_callback(
+                    db_path=str(selected_db),
+                    state=state,
+                    code=code,
+                    error=err,
+                    error_description=err_desc,
+                )
+                self._send_html(int(status_code), str(body))
+                return
             if p in {"/", "/ui"}:
                 if not web_ui_enabled:
                     self._send_json(404, {"ok": False, "error": "web ui disabled"})
@@ -2005,7 +3214,14 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
                 self._send_html(200, _TIMER_WEB_UI_HTML)
                 return
             if p == "/health":
-                self._send_json(200, {"ok": True, "service": "timer-api"})
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "timer-api",
+                        "google_oauth_redirect_uri": (google_redirect_uri or None),
+                    },
+                )
                 return
             if p == "/api/system/metrics":
                 if not web_ui_enabled:
@@ -2020,6 +3236,9 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
                 )
                 return
             if p == "/timer/status":
+                if not self._client_is_local():
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
                 with state_lock:
                     payload = {
                         "ok": True,
@@ -2031,6 +3250,9 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
                         "web_ui_enabled": bool(web_ui_enabled),
                         "workspace": str(runtime.workspace),
                         "tasks_path": str(runtime.workspace / "tasks.md"),
+                        "mode": ("all_agents" if include_all_agents else "single"),
+                        "target_count": int(len(targets)),
+                        "targets": [_timer_target_meta(t) for t in targets],
                         "started_at": status.get("started_at"),
                         "last_tick_at": status.get("last_tick_at"),
                         "last_error": status.get("last_error"),
@@ -2041,6 +3263,9 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
             self._send_json(404, {"ok": False, "error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
+            if not self._client_is_local():
+                self._send_json(403, {"ok": False, "error": "forbidden"})
+                return
             p = urlparse(self.path).path
             if p == "/timer/tick":
                 code, payload = _do_tick("manual")
@@ -2068,8 +3293,16 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
                 if m < 0:
                     self._send_json(400, {"ok": False, "error": "minutes must be >= 0"})
                     return
-                runtime.minutes = int(m)
-                self._send_json(200, {"ok": True, "interval_minutes": int(runtime.minutes)})
+                for t in targets:
+                    t.runtime.minutes = int(m)
+                out = {
+                    "ok": True,
+                    "interval_minutes": int(runtime.minutes),
+                    "target_count": int(len(targets)),
+                }
+                if include_all_agents:
+                    out["mode"] = "all_agents"
+                self._send_json(200, out)
                 return
             self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -2077,9 +3310,15 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
     worker.start()
 
     srv = ThreadingHTTPServer((host, port), _Handler)
+    tasks_str = (
+        str(runtime.workspace / "tasks.md")
+        if len(targets) == 1
+        else f"{len(targets)} targets"
+    )
     sys.stdout.write(
         f"freeclaw timer-api listening on http://{host}:{port} "
-        f"(poll={poll_seconds}s; tasks={runtime.workspace / 'tasks.md'}; web_ui={'on' if web_ui_enabled else 'off'})\n"
+        f"(mode={'all-agents' if include_all_agents else 'single'}; targets={len(targets)}; "
+        f"poll={poll_seconds}s; tasks={tasks_str}; web_ui={'on' if web_ui_enabled else 'off'})\n"
     )
     sys.stdout.flush()
 
@@ -2090,6 +3329,10 @@ def cmd_timer_api(args: argparse.Namespace) -> int:
     finally:
         log.info("timer-api stopping")
         stop_event.set()
+        try:
+            tick_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         try:
             srv.shutdown()
         except Exception:
@@ -2280,6 +3523,24 @@ def cmd_config_env_init(args: argparse.Namespace) -> int:
                 "# FREECLAW_BASE_URL=https://integrate.api.nvidia.com/v1",
                 "# FREECLAW_TOOL_ROOT=.",
                 "",
+                "# Google OAuth (built into freeclaw; no external auth server required):",
+                "FREECLAW_GOOGLE_CLIENT_ID=",
+                "FREECLAW_GOOGLE_CLIENT_SECRET=",
+                "FREECLAW_GOOGLE_REDIRECT_URI=http://<PUBLIC_IP>:3000/v1/oauth/callback",
+                "FREECLAW_GOOGLE_DEFAULT_SCOPES=https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly openid email",
+                "FREECLAW_GOOGLE_OAUTH_TIMEOUT_S=20.0",
+                "FREECLAW_GOOGLE_CONNECT_EXPIRES_S=900",
+                "",
+                "# Discord bot + timer notifications:",
+                "# DISCORD_BOT_TOKEN=",
+                "# FREECLAW_TIMER_DISCORD_NOTIFY=true",
+                "# FREECLAW_TIMER_DISCORD_CHANNEL_ID=",
+                "# FREECLAW_TIMER_DISCORD_WEBHOOK_URL=",
+                "# FREECLAW_TIMER_DISCORD_TIMEOUT_S=10.0",
+                "# FREECLAW_TIMER_DISCORD_CONTEXT=true",
+                "# FREECLAW_TIMER_DISCORD_CONTEXT_MAX_MESSAGES=24",
+                "# FREECLAW_TIMER_DISCORD_CONTEXT_MAX_CHARS=12000",
+                "",
             ]
         ),
         encoding="utf-8",
@@ -2352,6 +3613,73 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _discord_timer_sidecar_port(args: argparse.Namespace) -> int:
+    raw = getattr(args, "web_ui_port", None)
+    if raw is None:
+        return 3000
+    try:
+        p = int(raw)
+    except Exception:
+        return 3000
+    if p < 1 or p > 65535:
+        return 3000
+    return int(p)
+
+
+def _timer_api_running_on_localhost(*, port: int, timeout_s: float = 0.75) -> bool:
+    p = int(port)
+    if p < 1 or p > 65535:
+        return False
+    url = f"http://127.0.0.1:{p}/health"
+    req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            if int(getattr(resp, "status", 0) or 0) != 200:
+                return False
+            raw = resp.read(4096)
+    except Exception:
+        return False
+    if not raw:
+        return False
+    try:
+        obj = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    return isinstance(obj, dict) and str(obj.get("service") or "").strip() == "timer-api"
+
+
+def _build_discord_timer_sidecar_argv(args: argparse.Namespace, *, all_agents: bool = False) -> list[str]:
+    cmd: list[str] = [sys.executable, "-m", "freeclaw"]
+    if getattr(args, "env_file", None):
+        cmd += ["--env-file", str(args.env_file)]
+    if getattr(args, "config", None):
+        cmd += ["--config", str(args.config)]
+    if getattr(args, "log_level", None):
+        cmd += ["--log-level", str(args.log_level)]
+    if getattr(args, "log_file", None):
+        cmd += ["--log-file", str(args.log_file)]
+    if getattr(args, "log_format", None):
+        cmd += ["--log-format", str(args.log_format)]
+    cmd += ["--no-onboard", "timer-api"]
+    if bool(all_agents):
+        cmd += ["--all-agents"]
+    # Keep Discord auto-sidecar deterministic on a single port, while allowing public web access.
+    port = _discord_timer_sidecar_port(args)
+    host = "0.0.0.0"
+    if bool(getattr(args, "web_ui_localonly", False)):
+        host = "127.0.0.1"
+    elif getattr(args, "web_ui_host", None) is not None:
+        host = str(args.web_ui_host)
+    elif bool(getattr(args, "web_ui_public", False)):
+        host = "0.0.0.0"
+    cmd += ["--host", host, "--port", str(int(port))]
+    if bool(getattr(args, "no_web_ui", False)):
+        cmd += ["--no-web-ui"]
+    else:
+        cmd += ["--web-ui"]
+    return cmd
+
+
 def cmd_discord(args: argparse.Namespace) -> int:
     # Multi-agent default: if no explicit --agent is selected, launch a bot for the
     # base config + every config/agents/<name>/ profile (unless opted out).
@@ -2371,38 +3699,6 @@ def cmd_discord(args: argparse.Namespace) -> int:
         (cfg.model or "auto"),
         str(args.config or "(default)"),
     )
-    web_ui_proc: subprocess.Popen[bytes] | None = None
-
-    if bool(getattr(cfg, "web_ui_enabled", True)) and not bool(getattr(args, "no_web_ui_autostart", False)):
-        web_ui_cmd: list[str] = [sys.executable, "-m", "freeclaw"]
-        if getattr(args, "env_file", None):
-            web_ui_cmd += ["--env-file", str(args.env_file)]
-        if getattr(args, "config", None):
-            web_ui_cmd += ["--config", str(args.config)]
-        if args.log_level:
-            web_ui_cmd += ["--log-level", str(args.log_level)]
-        if args.log_file:
-            web_ui_cmd += ["--log-file", str(args.log_file)]
-        if getattr(args, "log_format", None):
-            web_ui_cmd += ["--log-format", str(args.log_format)]
-        web_ui_cmd += [
-            "--no-onboard",
-            "timer-api",
-            "--host",
-            str(getattr(args, "web_ui_host", None) or "0.0.0.0"),
-            "--port",
-            str(getattr(args, "web_ui_port", None) or int(getattr(cfg, "web_ui_port", 3000))),
-        ]
-        if bool(getattr(args, "no_web_ui", False)):
-            web_ui_cmd += ["--no-web-ui"]
-        try:
-            sys.stderr.write(f"[discord] start web-ui: {shlex.join(web_ui_cmd)}\n")
-            sys.stderr.flush()
-            web_ui_proc = subprocess.Popen(web_ui_cmd, env=dict(_REAL_ENV_AT_START))
-        except Exception as e:
-            sys.stderr.write(f"[discord] warning: could not start web-ui sidecar: {e}\n")
-            sys.stderr.flush()
-
     client = _client_from_config(cfg)
 
     if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
@@ -2461,7 +3757,21 @@ def cmd_discord(args: argparse.Namespace) -> int:
     )
     system_prompt = _build_system_prompt(core + (base_system or ""), skills_block)
 
+    timer_proc: subprocess.Popen[bytes] | None = None
     try:
+        if not bool(getattr(args, "no_web_ui_autostart", False)):
+            timer_port = _discord_timer_sidecar_port(args)
+            if _timer_api_running_on_localhost(port=timer_port):
+                log.info("discord timer sidecar skipped; timer-api already running on port=%d", int(timer_port))
+            else:
+                targv = _build_discord_timer_sidecar_argv(args)
+                sys.stderr.write(f"[timer] start: {shlex.join(targv)}\n")
+                sys.stderr.flush()
+                timer_proc = subprocess.Popen(targv, env=dict(_REAL_ENV_AT_START))
+        agent_arg = getattr(args, "agent", None)
+        agent_label = (str(agent_arg).strip() if agent_arg is not None else "")
+        if not agent_label:
+            agent_label = (str(getattr(cfg, "assistant_name", "")).strip() or "base")
         asyncio.run(
             run_discord_bot(
                 token=args.token,
@@ -2486,23 +3796,23 @@ def cmd_discord(args: argparse.Namespace) -> int:
                     else cfg.discord_history_messages
                 ),
                 workspace=workspace_p,
-                bot_label=((str(getattr(args, "agent", "")).strip()) or "base"),
+                bot_label=agent_label,
             )
         )
     finally:
-        log.info("discord stopping mode=single")
-        if web_ui_proc is not None:
+        if timer_proc is not None:
             try:
-                web_ui_proc.terminate()
+                timer_proc.terminate()
             except Exception:
                 pass
             try:
-                web_ui_proc.wait(timeout=2.0)
+                timer_proc.wait(timeout=3.0)
             except Exception:
                 try:
-                    web_ui_proc.kill()
+                    timer_proc.kill()
                 except Exception:
                     pass
+        log.info("discord stopping mode=single")
     return 0
 
 
@@ -2573,39 +3883,17 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
             cmd += ["--history-messages", str(args.history_messages)]
         return cmd
 
-    cfg = load_config(args.config)
     log.info("discord start mode=multi agents=%d", len(agent_names))
-    web_ui_proc: subprocess.Popen[bytes] | None = None
-    if bool(getattr(cfg, "web_ui_enabled", True)) and not bool(getattr(args, "no_web_ui_autostart", False)):
-        web_ui_cmd: list[str] = [sys.executable, "-m", "freeclaw"]
-        if getattr(args, "env_file", None):
-            web_ui_cmd += ["--env-file", str(args.env_file)]
-        if getattr(args, "config", None):
-            web_ui_cmd += ["--config", str(args.config)]
-        if args.log_level:
-            web_ui_cmd += ["--log-level", str(args.log_level)]
-        if args.log_file:
-            web_ui_cmd += ["--log-file", str(args.log_file)]
-        if getattr(args, "log_format", None):
-            web_ui_cmd += ["--log-format", str(args.log_format)]
-        web_ui_cmd += [
-            "--no-onboard",
-            "timer-api",
-            "--host",
-            str(getattr(args, "web_ui_host", None) or "0.0.0.0"),
-            "--port",
-            str(getattr(args, "web_ui_port", None) or int(getattr(cfg, "web_ui_port", 3000))),
-        ]
-        if bool(getattr(args, "no_web_ui", False)):
-            web_ui_cmd += ["--no-web-ui"]
-        try:
-            sys.stderr.write(f"[discord] start web-ui: {shlex.join(web_ui_cmd)}\n")
+    timer_proc: subprocess.Popen[bytes] | None = None
+    if not bool(getattr(args, "no_web_ui_autostart", False)):
+        timer_port = _discord_timer_sidecar_port(args)
+        if _timer_api_running_on_localhost(port=timer_port):
+            log.info("discord timer sidecar skipped; timer-api already running on port=%d", int(timer_port))
+        else:
+            targv = _build_discord_timer_sidecar_argv(args, all_agents=True)
+            sys.stderr.write(f"[timer] start: {shlex.join(targv)}\n")
             sys.stderr.flush()
-            web_ui_proc = subprocess.Popen(web_ui_cmd, env=dict(_REAL_ENV_AT_START))
-        except Exception as e:
-            sys.stderr.write(f"[discord] warning: could not start web-ui sidecar: {e}\n")
-            sys.stderr.flush()
-
+            timer_proc = subprocess.Popen(targv, env=dict(_REAL_ENV_AT_START))
     procs: list[tuple[str, subprocess.Popen[bytes]]] = []
     # Base config first (the "freeclaw" bot).
     procs.append(("base", _spawn("base", _child_argv(None), env=dict(_REAL_ENV_AT_START))))
@@ -2619,6 +3907,20 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
     exit_code = 0
     try:
         while procs:
+            if timer_proc is not None and timer_proc.poll() is not None:
+                timer_port = _discord_timer_sidecar_port(args)
+                if _timer_api_running_on_localhost(port=timer_port):
+                    log.info(
+                        "discord timer sidecar exited; timer-api detected on port=%d so restart is skipped",
+                        int(timer_port),
+                    )
+                    timer_proc = None
+                else:
+                    targv = _build_discord_timer_sidecar_argv(args, all_agents=True)
+                    log.warning("discord timer sidecar exited; restarting")
+                    sys.stderr.write(f"[timer] restart: {shlex.join(targv)}\n")
+                    sys.stderr.flush()
+                    timer_proc = subprocess.Popen(targv, env=dict(_REAL_ENV_AT_START))
             alive: list[tuple[str, subprocess.Popen[bytes]]] = []
             for label, p in procs:
                 rc = p.poll()
@@ -2636,6 +3938,11 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
     except KeyboardInterrupt:
         sys.stderr.write("\n[discord] stopping...\n")
         sys.stderr.flush()
+        if timer_proc is not None:
+            try:
+                timer_proc.terminate()
+            except Exception:
+                pass
         for _, p in procs:
             try:
                 p.terminate()
@@ -2656,21 +3963,19 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
                 p.kill()
             except Exception:
                 pass
-        exit_code = 130
-    finally:
-        log.info("discord supervisor stopping exit_code=%d", int(exit_code))
-        if web_ui_proc is not None:
+        if timer_proc is not None:
             try:
-                web_ui_proc.terminate()
+                timer_proc.kill()
             except Exception:
                 pass
+        exit_code = 130
+    finally:
+        if timer_proc is not None:
             try:
-                web_ui_proc.wait(timeout=2.0)
+                timer_proc.terminate()
             except Exception:
-                try:
-                    web_ui_proc.kill()
-                except Exception:
-                    pass
+                pass
+        log.info("discord supervisor stopping exit_code=%d", int(exit_code))
 
     return int(exit_code)
 
@@ -2818,7 +4123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--log-file",
         default=None,
-        help="Optional log file path. You can also set FREECLAW_LOG_FILE.",
+        help="Log file path (default: <config>/freeclaw.log). You can also set FREECLAW_LOG_FILE.",
     )
     parser.add_argument(
         "--log-format",
@@ -3044,6 +4349,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_ta.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
     p_ta.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results.")
+    p_ta.add_argument(
+        "--all-agents",
+        action="store_true",
+        help="Authoritative mode: check due tasks for base config plus all agent profiles on each tick.",
+    )
     g_ta_web = p_ta.add_mutually_exclusive_group()
     g_ta_web.add_argument(
         "--web-ui",
@@ -3058,13 +4368,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="Disable Web UI dashboard routes.",
     )
-    p_ta.add_argument("--host", default="127.0.0.1", help="Bind host for timer API server.")
+    p_ta.add_argument("--host", default="0.0.0.0", help="Bind host for timer API server (default: public bind).")
+    p_ta.add_argument(
+        "--allow-remote-host",
+        action="store_true",
+        help="Deprecated: public bind is now default. Timer control endpoints remain localhost-only.",
+    )
+    p_ta.add_argument(
+        "--localhost-only-host",
+        action="store_true",
+        help="Restrict timer-api bind host to localhost only.",
+    )
     p_ta.add_argument("--port", type=int, default=None, help="Bind port for timer API server (default from config web_ui_port; 3000).")
     p_ta.add_argument(
         "--poll-seconds",
         type=float,
-        default=15.0,
-        help="Background scheduler poll interval in seconds.",
+        default=300.0,
+        help="Background scheduler poll interval in seconds (default: 300).",
     )
     p_ta.set_defaults(func=cmd_timer_api)
 
@@ -3174,18 +4494,28 @@ def main(argv: list[str] | None = None) -> int:
     p_discord.add_argument(
         "--web-ui-host",
         default=None,
-        help="Host bind for auto-started web UI sidecar (default: 0.0.0.0).",
+        help=argparse.SUPPRESS,
+    )
+    p_discord.add_argument(
+        "--web-ui-public",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_discord.add_argument(
+        "--web-ui-localonly",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     p_discord.add_argument(
         "--web-ui-port",
         type=int,
         default=None,
-        help="Port for auto-started web UI sidecar (default from config web_ui_port).",
+        help=argparse.SUPPRESS,
     )
     p_discord.add_argument(
         "--no-web-ui",
         action="store_true",
-        help="Start sidecar but disable dashboard routes in timer-api.",
+        help=argparse.SUPPRESS,
     )
     p_discord.add_argument(
         "--no-web-ui-autostart",

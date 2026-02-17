@@ -10,6 +10,7 @@ INstall
     cd freeclaw
     pip install -r requirements.txt
     python -m freeclaw onboard ( you will need an API key and a dicord bot key, I explain in detail here: https://medium.com/@jerryhowell/free-openclaw-alternative-freeclaw-ecf537abbcd0)
+    python -m freeclaw timer-api   # start once (shared scheduler)
     python -m freeclaw discord ( or chat if you want to chat via SSH )
 
 
@@ -29,6 +30,11 @@ Discord default behavior:
 - `python -m freeclaw discord` launches all Discord bots: base config + every `config/agents/<name>/` profile.
 - Run only the base config bot: `python -m freeclaw discord --no-all-agents`
 - Run only one agent: `python -m freeclaw --agent <name> discord`
+- Timer behavior with Discord:
+  - If no local timer-api is running on the sidecar port (default `3000`), Discord auto-starts a timer sidecar.
+  - If timer-api is already running on that port, Discord skips sidecar start.
+- Workspace docs:
+  - `google.md` is auto-created in each bot workspace with step-by-step Google Cloud OAuth setup instructions.
 
 ## Configuration
 
@@ -45,6 +51,14 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_TASK_TIMER_MINUTES` (default: `30`; 0 disables the task timer)
 - `FREECLAW_WEB_UI_ENABLED` (default: `true`; enables Web UI routes in `timer-api`)
 - `FREECLAW_WEB_UI_PORT` (default: `3000`; default `timer-api` bind port)
+- `FREECLAW_TIMER_DISCORD_NOTIFY` (default: `true`; when a timer run executes due tasks, send a Discord summary if destination is configured)
+- `FREECLAW_TIMER_DISCORD_CHANNEL_ID` (optional; channel id for timer notifications via bot token; if unset, freeclaw tries to auto-detect the bot's most recent channel)
+- `FREECLAW_TIMER_DISCORD_BOT_TOKEN` (optional; overrides `DISCORD_BOT_TOKEN`/`FREECLAW_DISCORD_TOKEN` for timer notifications)
+- `FREECLAW_TIMER_DISCORD_WEBHOOK_URL` (optional; if set, webhook is used for timer notifications)
+- `FREECLAW_TIMER_DISCORD_TIMEOUT_S` (default: `10.0`; timeout for timer notification HTTP calls)
+- `FREECLAW_TIMER_DISCORD_CONTEXT` (default: `true`; include recent Discord session history in timer-run prompts)
+- `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_MESSAGES` (default: `24`; max recent user/assistant messages to include)
+- `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_CHARS` (default: `12000`; char budget for injected Discord context)
 - `FREECLAW_TOOL_MAX_READ_BYTES` (default: `200000`)
 - `FREECLAW_TOOL_MAX_WRITE_BYTES` (default: `2000000`)
 - `FREECLAW_TOOL_MAX_LIST_ENTRIES` (default: `2000`)
@@ -53,6 +67,12 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_WEB_MAX_BYTES` (default: `500000`)
 - `FREECLAW_WEB_USER_AGENT` (default: `freeclaw/0.1.0 (+https://github.com/freeclaw/freeclaw)`)
 - `FREECLAW_MEMORY_DB` (default: `./config/memory.sqlite3`; shared across CLI + Discord in the same project)
+- `FREECLAW_GOOGLE_CLIENT_ID` (required for Google connect; OAuth web client id)
+- `FREECLAW_GOOGLE_CLIENT_SECRET` (OAuth web client secret)
+- `FREECLAW_GOOGLE_REDIRECT_URI` (required for Google connect; e.g. `http://<PUBLIC_IP>:3000/v1/oauth/callback`)
+- `FREECLAW_GOOGLE_DEFAULT_SCOPES` (default: calendar+gmail readonly + `openid email`)
+- `FREECLAW_GOOGLE_OAUTH_TIMEOUT_S` (default: `20.0`; timeout for Google OAuth HTTP calls)
+- `FREECLAW_GOOGLE_CONNECT_EXPIRES_S` (default: `900`; pending connect flow expiry in seconds)
 - `FREECLAW_ENABLE_SHELL` (default: enabled; set to `false` to disable `sh_exec`)
 - `FREECLAW_SHELL_TIMEOUT_S` (default: `20.0`)
 - `FREECLAW_SHELL_MAX_OUTPUT_BYTES` (default: `200000`)
@@ -60,8 +80,8 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_ENABLE_CUSTOM_TOOLS` (default: enabled; set to `false` to disable loading custom tools from disk)
 - `FREECLAW_CUSTOM_TOOLS_DIR` (default: `<workspace>/.freeclaw/tools`; must be within workspace)
 - `FREECLAW_CUSTOM_TOOLS_BLOCK_NETWORK` (default: `false`; if `true`, blocks `curl/wget/ssh/nc/...` for custom tools)
-- `FREECLAW_LOG_LEVEL` (default: `warning`)
-- `FREECLAW_LOG_FILE` (default: unset; logs go to stderr)
+- `FREECLAW_LOG_LEVEL` (default: `info`)
+- `FREECLAW_LOG_FILE` (default: `./config/freeclaw.log`; set to empty string to disable file logging)
 - `FREECLAW_LOG_FORMAT` (default: `text`; options: `text`, `jsonl`)
 
 Workspace safety:
@@ -91,6 +111,9 @@ Config utilities:
 - `python -m freeclaw config validate`
 
 ## Logging
+
+By default, logs are written to `./config/freeclaw.log` and stderr.
+The logfile rotates at 100KB with up to 3 backups (`freeclaw.log.1`..`.3`), pruning older entries automatically.
 
 CLI flags:
 
@@ -177,6 +200,11 @@ Additional tools:
 
 - Web: `web_search` (DuckDuckGo via `ddgs`) and `web_fetch` (public http(s) URL fetch; blocks localhost/private IPs).
 - HTTP: `http_request_json` calls a public http(s) JSON API and returns parsed JSON (blocks localhost/private IPs).
+- Local timer API: `timer_api_get` queries the local `timer-api` server (`/api/system/metrics`, `/timer/status`, `/health`) and is localhost-only.
+- Google:
+  - Email: `google_email_list`, `google_email_get`, `google_email_send`
+  - Calendar: `google_calendar_list`, `google_calendar_create`
+  - These tools use the connected Google account for a specific `bot_id` + `discord_user_id` pair and require appropriate OAuth scopes.
 - Memory: `memory_*` stores notes in a local SQLite DB. This memory is shared across CLI + Discord for the current project by default; override with `FREECLAW_MEMORY_DB`. Notes can be `pinned` or given a `ttl_seconds` expiry.
 - Task scheduler: `task_*` manages recurring `tasks.md` entries (list/add/update/enable/disable/run-now) in structured form.
 - Docs: `doc_ingest`/`doc_inject`, `doc_search`, `doc_get`, `doc_list`, `doc_delete` build and manage a persistent workspace document index (text + PDF via `pypdf`).
@@ -218,6 +246,7 @@ Template vars in `argv`:
 
 The task timer reads `<workspace>/tasks.md` and looks for unchecked checklist items (`- [ ] ...`).
 It only calls the model when there are pending tasks.
+By default, timer runs also inject bounded recent Discord session context (latest saved channel session) for continuity.
 
 Run it:
 
@@ -239,13 +268,25 @@ If you want freeclaw itself to handle scheduling (instead of systemd), run:
 python -m freeclaw timer-api
 ```
 
+For a single authoritative scheduler across base + all configured agents:
+
+```bash
+python -m freeclaw timer-api --all-agents
+```
+
 This starts an HTTP server with a background scheduler that checks `tasks.md` and wakes the model when tasks are due.
-By default it binds to `127.0.0.1:3000`. You can disable Web UI routes in onboarding, or at runtime with `--no-web-ui`.
+By default it binds to `0.0.0.0:3000`. You can disable Web UI routes in onboarding, or at runtime with `--no-web-ui`.
+The same server also handles Google OAuth callback requests on `/v1/oauth/callback`.
+
+Timer-to-Discord delivery:
+- If `FREECLAW_TIMER_DISCORD_WEBHOOK_URL` is set, due-task run summaries are posted to that webhook.
+- Otherwise, if a bot token (`FREECLAW_TIMER_DISCORD_BOT_TOKEN` or `DISCORD_BOT_TOKEN`) is set, freeclaw posts to `FREECLAW_TIMER_DISCORD_CHANNEL_ID` when provided, or auto-detects the latest channel used by that bot.
 
 Useful endpoints:
 
 - `GET /` (Web UI dashboard)
 - `GET /health`
+- `GET /v1/oauth/callback` (Google OAuth redirect target)
 - `GET /timer/status`
 - `GET /api/system/metrics` (CPU/RAM/temp/GPU/VRAM/uptime/bandwidth/storage/top processes + active bot token usage with 24h/7d history)
 - `POST /timer/tick` (force a tick now)
@@ -356,5 +397,9 @@ Slash commands (if the bot has `applications.commands` scope and sync succeeds):
 - `/persona show` show persona
 - `/persona set` set persona
 - `/memory search` search saved memory
+- `/google connect` start Google account link for this bot/user
+- `/google poll` poll Google connect status
+- `/google status` show linked Google account for this bot/user
+- `/google disconnect` unlink Google account for this bot/user
 
 Discord conversation sessions persist across bot restarts in the same SQLite DB used for memory (default: `./config/memory.sqlite3`; override with `FREECLAW_MEMORY_DB`).

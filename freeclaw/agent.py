@@ -7,6 +7,17 @@ from .tools import ToolContext, dispatch_tool_call, tool_schemas
 
 log = logging.getLogger(__name__)
 
+
+_CORE_TOOL_NAMES = {
+    "text_search",
+    "web_search",
+    "web_fetch",
+    "http_request_json",
+    "timer_api_get",
+    "sh_exec",
+}
+
+
 class ChatClient(Protocol):
     def chat(
         self,
@@ -65,8 +76,10 @@ def _sanitize_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
         nm = fn.get("name")
         if not isinstance(nm, str) or not nm.strip():
             continue
-        args = fn.get("arguments", "{}")
-        if not isinstance(args, str) or not _is_json_object(args):
+        # Some providers omit function.arguments entirely; normalize to "{}".
+        # Others return malformed/invalid JSON; also normalize to "{}".
+        has_valid_args = ("arguments" in fn) and isinstance(fn.get("arguments"), str) and _is_json_object(str(fn.get("arguments")))
+        if not has_valid_args:
             tc2 = dict(tc)
             fn2 = dict(fn)
             fn2["arguments"] = "{}"
@@ -101,6 +114,37 @@ def _is_tool_grammar_error(exc: Exception) -> bool:
         or ("structural_tag" in m)
         or ("tool_calls_section_begin" in m)
     )
+
+
+def _reduce_tools_for_grammar_retry(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Build a smaller tool list for providers that reject large tool grammars.
+
+    Keep core families (fs/memory/task/doc/web/http/shell) and drop heavier
+    integrations so we can still run tool turns instead of disabling tools.
+    """
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str):
+            continue
+        nm = name.strip()
+        if not nm:
+            continue
+        if (
+            nm in _CORE_TOOL_NAMES
+            or nm.startswith("fs_")
+            or nm.startswith("memory_")
+            or nm.startswith("task_")
+            or nm.startswith("doc_")
+        ):
+            out.append(t)
+    return out
 
 
 def run_agent(
@@ -144,15 +188,45 @@ def run_agent(
             )
         except Exception as e:
             # Some providers (notably NIM) can intermittently reject tool schemas
-            # with grammar/cache errors. Retry once without tools for this turn.
+            # with grammar/cache errors. Retry once with a reduced toolset, then
+            # fall back to no-tools for this turn.
             if tools and _is_tool_grammar_error(e):
-                log.warning("provider rejected tool grammar; retrying this turn without tools: %s", e)
-                last_resp = client.chat(
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=None,
-                )
+                reduced_tools = _reduce_tools_for_grammar_retry(tools)
+                if reduced_tools and len(reduced_tools) < len(tools):
+                    log.warning(
+                        "provider rejected tool grammar; retrying with reduced tools (%d -> %d): %s",
+                        len(tools),
+                        len(reduced_tools),
+                        e,
+                    )
+                    try:
+                        last_resp = client.chat(
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=reduced_tools,
+                        )
+                    except Exception as e2:
+                        if not _is_tool_grammar_error(e2):
+                            raise
+                        log.warning(
+                            "provider still rejected reduced tool grammar; retrying this turn without tools: %s",
+                            e2,
+                        )
+                        last_resp = client.chat(
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=None,
+                        )
+                else:
+                    log.warning("provider rejected tool grammar; retrying this turn without tools: %s", e)
+                    last_resp = client.chat(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=None,
+                    )
             else:
                 raise
         log.debug("agent step=%d finish_reason=%s", steps, (_extract_finish_reason(last_resp) or "unknown"))
@@ -250,8 +324,7 @@ def run_agent(
             if not isinstance(tc_id, str) or not isinstance(name, str) or not isinstance(args_json, str):
                 continue
 
-            if verbose_tools:
-                log.info("[tool] %s %s", name, args_json)
+            log.info("[tool] %s %s", name, args_json)
 
             try:
                 result = dispatch_tool_call(tool_ctx, name, args_json)
@@ -263,8 +336,7 @@ def run_agent(
                     err["arguments_json"] = args_json
                 content = json.dumps(err, ensure_ascii=True)
 
-            if verbose_tools:
-                log.info("[tool-result] %s", content[:4000])
+            log.info("[tool-result] %s", content[:4000])
 
             messages.append(
                 {

@@ -15,12 +15,20 @@ from .fs import (
     fs_stat,
     fs_write,
 )
+from .google_local import (
+    google_calendar_create,
+    google_calendar_list,
+    google_email_get,
+    google_email_list,
+    google_email_send,
+)
 from .http import http_request_json
 from .memory import memory_add, memory_delete, memory_get, memory_search
 from .doc_ingest import doc_delete, doc_get, doc_ingest, doc_list, doc_search
 from .shell import sh_exec
 from .search import text_search
 from .task_scheduler import task_add, task_disable, task_enable, task_list, task_run_now, task_update
+from .timer_api import timer_api_get
 from .web import web_fetch, web_search
 
 
@@ -47,6 +55,12 @@ def tool_schemas(
         "web_search",
         "web_fetch",
         "http_request_json",
+        "timer_api_get",
+        "google_email_list",
+        "google_email_get",
+        "google_email_send",
+        "google_calendar_list",
+        "google_calendar_create",
         "memory_add",
         "memory_get",
         "memory_search",
@@ -306,6 +320,124 @@ def tool_schemas(
                         "max_bytes": {"type": ["integer", "null"], "default": None},
                     },
                     "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "timer_api_get",
+                "description": "Query the local timer-api (localhost-only) for health/status/system metrics.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "endpoint": {
+                            "type": "string",
+                            "enum": ["system_metrics", "status", "health"],
+                            "default": "system_metrics",
+                        },
+                        "host": {
+                            "type": "string",
+                            "default": "127.0.0.1",
+                            "description": "Localhost only: 127.0.0.1, localhost, or ::1",
+                        },
+                        "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 3000},
+                        "timeout_s": {"type": "number", "minimum": 0.1, "default": 5.0},
+                        "max_bytes": {"type": ["integer", "null"], "default": None},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "google_email_list",
+                "description": "List recent Gmail messages for a linked bot/user account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bot_id": {"type": "integer"},
+                        "discord_user_id": {"type": "integer"},
+                        "query": {"type": ["string", "null"], "default": None},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                    },
+                    "required": ["bot_id", "discord_user_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "google_email_get",
+                "description": "Get a Gmail message by message_id for a linked bot/user account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bot_id": {"type": "integer"},
+                        "discord_user_id": {"type": "integer"},
+                        "message_id": {"type": "string"},
+                    },
+                    "required": ["bot_id", "discord_user_id", "message_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "google_email_send",
+                "description": "Send a Gmail message for a linked bot/user account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bot_id": {"type": "integer"},
+                        "discord_user_id": {"type": "integer"},
+                        "to": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body_text": {"type": "string"},
+                        "cc": {"type": ["string", "null"], "default": None},
+                        "bcc": {"type": ["string", "null"], "default": None},
+                    },
+                    "required": ["bot_id", "discord_user_id", "to", "subject", "body_text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "google_calendar_list",
+                "description": "List upcoming calendar events for a linked bot/user account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bot_id": {"type": "integer"},
+                        "discord_user_id": {"type": "integer"},
+                        "calendar_id": {"type": "string", "default": "primary"},
+                        "time_min": {"type": ["string", "null"], "default": None},
+                        "time_max": {"type": ["string", "null"], "default": None},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 25, "default": 10},
+                    },
+                    "required": ["bot_id", "discord_user_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "google_calendar_create",
+                "description": "Create a calendar event for a linked bot/user account.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bot_id": {"type": "integer"},
+                        "discord_user_id": {"type": "integer"},
+                        "summary": {"type": "string"},
+                        "start_iso": {"type": "string"},
+                        "end_iso": {"type": "string"},
+                        "calendar_id": {"type": "string", "default": "primary"},
+                        "description": {"type": ["string", "null"], "default": None},
+                        "location": {"type": ["string", "null"], "default": None},
+                    },
+                    "required": ["bot_id", "discord_user_id", "summary", "start_iso", "end_iso"],
                 },
             },
         },
@@ -709,6 +841,64 @@ def dispatch_tool_call(ctx: ToolContext, name: str, arguments_json: str) -> dict
             json_body=args.get("json_body"),
             timeout_s=float(args.get("timeout_s", 20.0)),
             max_bytes=(None if mb is None else int(mb)),
+        )
+    if name == "timer_api_get":
+        mb = args.get("max_bytes")
+        return timer_api_get(
+            ctx,
+            endpoint=str(args.get("endpoint", "system_metrics")),
+            host=str(args.get("host", "127.0.0.1")),
+            port=int(args.get("port", 3000)),
+            timeout_s=float(args.get("timeout_s", 5.0)),
+            max_bytes=(None if mb is None else int(mb)),
+        )
+    if name == "google_email_list":
+        return google_email_list(
+            ctx,
+            bot_id=int(args.get("bot_id", 0)),
+            discord_user_id=int(args.get("discord_user_id", 0)),
+            query=(None if args.get("query") is None else str(args.get("query"))),
+            max_results=int(args.get("max_results", 10)),
+        )
+    if name == "google_email_get":
+        return google_email_get(
+            ctx,
+            bot_id=int(args.get("bot_id", 0)),
+            discord_user_id=int(args.get("discord_user_id", 0)),
+            message_id=str(args.get("message_id", "")),
+        )
+    if name == "google_email_send":
+        return google_email_send(
+            ctx,
+            bot_id=int(args.get("bot_id", 0)),
+            discord_user_id=int(args.get("discord_user_id", 0)),
+            to=str(args.get("to", "")),
+            subject=str(args.get("subject", "")),
+            body_text=str(args.get("body_text", "")),
+            cc=(None if args.get("cc") is None else str(args.get("cc"))),
+            bcc=(None if args.get("bcc") is None else str(args.get("bcc"))),
+        )
+    if name == "google_calendar_list":
+        return google_calendar_list(
+            ctx,
+            bot_id=int(args.get("bot_id", 0)),
+            discord_user_id=int(args.get("discord_user_id", 0)),
+            calendar_id=str(args.get("calendar_id", "primary")),
+            time_min=(None if args.get("time_min") is None else str(args.get("time_min"))),
+            time_max=(None if args.get("time_max") is None else str(args.get("time_max"))),
+            max_results=int(args.get("max_results", 10)),
+        )
+    if name == "google_calendar_create":
+        return google_calendar_create(
+            ctx,
+            bot_id=int(args.get("bot_id", 0)),
+            discord_user_id=int(args.get("discord_user_id", 0)),
+            summary=str(args.get("summary", "")),
+            start_iso=str(args.get("start_iso", "")),
+            end_iso=str(args.get("end_iso", "")),
+            calendar_id=str(args.get("calendar_id", "primary")),
+            description=(None if args.get("description") is None else str(args.get("description"))),
+            location=(None if args.get("location") is None else str(args.get("location"))),
         )
     if name == "memory_add":
         return memory_add(
