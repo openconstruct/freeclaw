@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..common import first_env
 from ..config import ClawConfig
-from ..http_client import get_json, post_json
-
-
-def _first_env(*names: str) -> str | None:
-    for n in names:
-        v = os.getenv(n)
-        if v and v.strip():
-            return v.strip()
-    return None
+from ..http_client import post_json
+from .common import build_chat_payload, extract_chat_text, fetch_openai_models, model_ids_from_entries
 
 
 def fetch_models(*, base_url: str, api_key: str, timeout_s: float = 30.0) -> list[dict[str, Any]]:
@@ -22,33 +15,19 @@ def fetch_models(*, base_url: str, api_key: str, timeout_s: float = 30.0) -> lis
 
     Returns a list of dict entries (raw objects), best-effort.
     """
-    url = base_url.rstrip("/") + "/models"
-    resp = get_json(
-        url,
+    return fetch_openai_models(
+        base_url=base_url,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
             "User-Agent": "freeclaw/0.1.0",
         },
         timeout_s=float(timeout_s),
-    ).json
-    data = resp.get("data")
-    if not isinstance(data, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for m in data:
-        if isinstance(m, dict):
-            out.append(m)
-    return out
+    )
 
 
 def model_ids(models: list[dict[str, Any]]) -> list[str]:
-    ids: list[str] = []
-    for m in models:
-        mid = m.get("id")
-        if isinstance(mid, str) and mid.strip():
-            ids.append(mid.strip())
-    return sorted(set(ids), key=str.lower)
+    return model_ids_from_entries(models)
 
 
 @dataclass(frozen=True)
@@ -61,7 +40,7 @@ class GroqChatClient:
 
     @staticmethod
     def from_config(cfg: ClawConfig) -> "GroqChatClient":
-        api_key = _first_env("GROQ_API_KEY", "GROQ_KEY")
+        api_key = first_env("GROQ_API_KEY", "GROQ_KEY")
         if not api_key:
             raise SystemExit("Missing Groq API key. Set GROQ_API_KEY.")
 
@@ -128,33 +107,15 @@ class GroqChatClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
-        payload: dict[str, Any] = {
-            "model": self._resolve_model(),
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = build_chat_payload(
+            model=self._resolve_model(),
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
         return post_json(url, headers=self._headers(), payload=payload, timeout_s=self.timeout_s).json
 
     @staticmethod
     def extract_text(resp: dict[str, Any]) -> str:
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("Unexpected response: missing choices")
-        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(msg, dict):
-            raise RuntimeError("Unexpected response: missing message")
-        content = msg.get("content")
-        if content is None:
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                return "[tool call requested; tool execution not implemented in freeclaw yet]"
-            return ""
-        if not isinstance(content, str):
-            return str(content)
-        return content
-
+        return extract_chat_text(resp)

@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Callable
 
 from .custom import custom_tool_schemas, dispatch_custom_tool_call
 from .fs import (
@@ -722,6 +722,286 @@ def tool_schemas(
     return tools
 
 
+def _as_opt_int(args: dict[str, Any], key: str) -> int | None:
+    return None if args.get(key) is None else int(args.get(key))
+
+
+def _as_opt_str(args: dict[str, Any], key: str) -> str | None:
+    return None if args.get(key) is None else str(args.get(key))
+
+
+def _dispatch_http_request_json(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    mb = args.get("max_bytes")
+    hdrs = args.get("headers")
+    if hdrs is not None and not isinstance(hdrs, dict):
+        raise ValueError("headers must be an object (map of string to string)")
+    return http_request_json(
+        ctx,
+        url=str(args.get("url", "")),
+        method=str(args.get("method", "GET")),
+        headers=(None if hdrs is None else {str(k): str(v) for k, v in hdrs.items()}),
+        json_body=args.get("json_body"),
+        timeout_s=float(args.get("timeout_s", 20.0)),
+        max_bytes=(None if mb is None else int(mb)),
+    )
+
+
+def _dispatch_sh_exec(ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+    argv = args.get("argv")
+    if not isinstance(argv, list):
+        raise ValueError("argv must be a list of strings")
+    env = args.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise ValueError("env must be an object (map of string to string)")
+    return sh_exec(
+        ctx,
+        argv=[str(x) for x in argv],
+        stdin=_as_opt_str(args, "stdin"),
+        env=(None if env is None else {str(k): str(v) for k, v in env.items()}),
+        timeout_s=(None if args.get("timeout_s") is None else float(args.get("timeout_s"))),
+        max_output_bytes=(
+            None if args.get("max_output_bytes") is None else int(args.get("max_output_bytes"))
+        ),
+    )
+
+
+_TOOL_DISPATCHERS: dict[str, Callable[[ToolContext, dict[str, Any]], dict[str, Any]]] = {
+    "text_search": lambda ctx, args: text_search(
+        ctx,
+        query=str(args.get("query", "")),
+        path=str(args.get("path", ".")),
+        regex=bool(args.get("regex", False)),
+        case_sensitive=bool(args.get("case_sensitive", False)),
+        include_glob=_as_opt_str(args, "include_glob"),
+        exclude_glob=_as_opt_str(args, "exclude_glob"),
+        max_results=int(args.get("max_results", 20)),
+        max_files=int(args.get("max_files", 200)),
+        context_lines=int(args.get("context_lines", 0)),
+    ),
+    "fs_read": lambda ctx, args: fs_read(
+        ctx,
+        path=str(args.get("path", "")),
+        start_line=int(args.get("start_line", 1)),
+        end_line=_as_opt_int(args, "end_line"),
+    ),
+    "fs_write": lambda ctx, args: fs_write(
+        ctx,
+        path=str(args.get("path", "")),
+        content=str(args.get("content", "")),
+        mode=str(args.get("mode", "overwrite")),
+        make_parents=bool(args.get("make_parents", True)),
+    ),
+    "fs_mkdir": lambda ctx, args: fs_mkdir(
+        ctx,
+        path=str(args.get("path", "")),
+        parents=bool(args.get("parents", True)),
+        exist_ok=bool(args.get("exist_ok", True)),
+    ),
+    "fs_list": lambda ctx, args: fs_list(
+        ctx,
+        path=str(args.get("path", ".")),
+        recursive=bool(args.get("recursive", False)),
+        max_depth=int(args.get("max_depth", 2)),
+    ),
+    "fs_stat": lambda ctx, args: fs_stat(ctx, path=str(args.get("path", ""))),
+    "fs_glob": lambda ctx, args: fs_glob(
+        ctx,
+        pattern=str(args.get("pattern", "")),
+        max_results=_as_opt_int(args, "max_results"),
+    ),
+    "fs_diff": lambda ctx, args: fs_diff(
+        ctx,
+        path=str(args.get("path", "")),
+        content=str(args.get("content", "")),
+        context_lines=int(args.get("context_lines", 3)),
+    ),
+    "fs_rm": lambda ctx, args: fs_rm(
+        ctx,
+        path=str(args.get("path", "")),
+        recursive=bool(args.get("recursive", False)),
+        missing_ok=bool(args.get("missing_ok", True)),
+    ),
+    "fs_mv": lambda ctx, args: fs_mv(
+        ctx,
+        src=str(args.get("src", "")),
+        dst=str(args.get("dst", "")),
+        overwrite=bool(args.get("overwrite", False)),
+        make_parents=bool(args.get("make_parents", True)),
+    ),
+    "fs_cp": lambda ctx, args: fs_cp(
+        ctx,
+        src=str(args.get("src", "")),
+        dst=str(args.get("dst", "")),
+        recursive=bool(args.get("recursive", False)),
+        overwrite=bool(args.get("overwrite", False)),
+        make_parents=bool(args.get("make_parents", True)),
+    ),
+    "web_search": lambda ctx, args: web_search(
+        ctx,
+        query=str(args.get("query", "")),
+        max_results=int(args.get("max_results", 5)),
+        safesearch=str(args.get("safesearch", "moderate")),
+    ),
+    "web_fetch": lambda ctx, args: web_fetch(
+        ctx,
+        url=str(args.get("url", "")),
+        max_bytes=_as_opt_int(args, "max_bytes"),
+        timeout_s=float(args.get("timeout_s", 20.0)),
+    ),
+    "http_request_json": _dispatch_http_request_json,
+    "timer_api_get": lambda ctx, args: timer_api_get(
+        ctx,
+        endpoint=str(args.get("endpoint", "system_metrics")),
+        host=str(args.get("host", "127.0.0.1")),
+        port=int(args.get("port", 3000)),
+        timeout_s=float(args.get("timeout_s", 5.0)),
+        max_bytes=_as_opt_int(args, "max_bytes"),
+    ),
+    "google_email_list": lambda ctx, args: google_email_list(
+        ctx,
+        bot_id=int(args.get("bot_id", 0)),
+        discord_user_id=int(args.get("discord_user_id", 0)),
+        query=_as_opt_str(args, "query"),
+        max_results=int(args.get("max_results", 10)),
+    ),
+    "google_email_get": lambda ctx, args: google_email_get(
+        ctx,
+        bot_id=int(args.get("bot_id", 0)),
+        discord_user_id=int(args.get("discord_user_id", 0)),
+        message_id=str(args.get("message_id", "")),
+    ),
+    "google_email_send": lambda ctx, args: google_email_send(
+        ctx,
+        bot_id=int(args.get("bot_id", 0)),
+        discord_user_id=int(args.get("discord_user_id", 0)),
+        to=str(args.get("to", "")),
+        subject=str(args.get("subject", "")),
+        body_text=str(args.get("body_text", "")),
+        cc=_as_opt_str(args, "cc"),
+        bcc=_as_opt_str(args, "bcc"),
+    ),
+    "google_calendar_list": lambda ctx, args: google_calendar_list(
+        ctx,
+        bot_id=int(args.get("bot_id", 0)),
+        discord_user_id=int(args.get("discord_user_id", 0)),
+        calendar_id=str(args.get("calendar_id", "primary")),
+        time_min=_as_opt_str(args, "time_min"),
+        time_max=_as_opt_str(args, "time_max"),
+        max_results=int(args.get("max_results", 10)),
+    ),
+    "google_calendar_create": lambda ctx, args: google_calendar_create(
+        ctx,
+        bot_id=int(args.get("bot_id", 0)),
+        discord_user_id=int(args.get("discord_user_id", 0)),
+        summary=str(args.get("summary", "")),
+        start_iso=str(args.get("start_iso", "")),
+        end_iso=str(args.get("end_iso", "")),
+        calendar_id=str(args.get("calendar_id", "primary")),
+        description=_as_opt_str(args, "description"),
+        location=_as_opt_str(args, "location"),
+    ),
+    "memory_add": lambda ctx, args: memory_add(
+        ctx,
+        content=str(args.get("content", "")),
+        key=_as_opt_str(args, "key"),
+        tags=(None if args.get("tags") is None else list(args.get("tags"))),
+        meta=(None if args.get("meta") is None else dict(args.get("meta"))),
+        pinned=bool(args.get("pinned", False)),
+        ttl_seconds=_as_opt_int(args, "ttl_seconds"),
+    ),
+    "memory_get": lambda ctx, args: memory_get(
+        ctx,
+        id=_as_opt_int(args, "id"),
+        key=_as_opt_str(args, "key"),
+        include_expired=bool(args.get("include_expired", False)),
+    ),
+    "memory_search": lambda ctx, args: memory_search(
+        ctx,
+        query=str(args.get("query", "")),
+        limit=int(args.get("limit", 5)),
+        include_expired=bool(args.get("include_expired", False)),
+    ),
+    "memory_delete": lambda ctx, args: memory_delete(
+        ctx,
+        id=_as_opt_int(args, "id"),
+        key=_as_opt_str(args, "key"),
+    ),
+    "task_list": lambda ctx, args: task_list(
+        ctx,
+        include_disabled=bool(args.get("include_disabled", True)),
+    ),
+    "task_add": lambda ctx, args: task_add(
+        ctx,
+        minutes=int(args.get("minutes", 0)),
+        task=str(args.get("task", "")),
+        enabled=bool(args.get("enabled", True)),
+        allow_duplicate=bool(args.get("allow_duplicate", False)),
+    ),
+    "task_update": lambda ctx, args: task_update(
+        ctx,
+        task_id=_as_opt_int(args, "task_id"),
+        task=_as_opt_str(args, "task"),
+        new_minutes=_as_opt_int(args, "new_minutes"),
+        new_task=_as_opt_str(args, "new_task"),
+    ),
+    "task_disable": lambda ctx, args: task_disable(
+        ctx,
+        task_id=_as_opt_int(args, "task_id"),
+        task=_as_opt_str(args, "task"),
+    ),
+    "task_enable": lambda ctx, args: task_enable(
+        ctx,
+        task_id=_as_opt_int(args, "task_id"),
+        task=_as_opt_str(args, "task"),
+    ),
+    "task_run_now": lambda ctx, args: task_run_now(
+        ctx,
+        task_id=_as_opt_int(args, "task_id"),
+        task=_as_opt_str(args, "task"),
+    ),
+    "doc_ingest": lambda ctx, args: doc_ingest(
+        ctx,
+        path=str(args.get("path", "")),
+        key=_as_opt_str(args, "key"),
+        title=_as_opt_str(args, "title"),
+        replace=bool(args.get("replace", True)),
+        max_chars=int(args.get("max_chars", 200000)),
+    ),
+    "doc_inject": lambda ctx, args: doc_ingest(
+        ctx,
+        path=str(args.get("path", "")),
+        key=_as_opt_str(args, "key"),
+        title=_as_opt_str(args, "title"),
+        replace=bool(args.get("replace", True)),
+        max_chars=int(args.get("max_chars", 200000)),
+    ),
+    "doc_search": lambda ctx, args: doc_search(
+        ctx,
+        query=str(args.get("query", "")),
+        limit=int(args.get("limit", 5)),
+    ),
+    "doc_get": lambda ctx, args: doc_get(
+        ctx,
+        id=_as_opt_int(args, "id"),
+        key=_as_opt_str(args, "key"),
+        include_content=bool(args.get("include_content", True)),
+        max_chars=int(args.get("max_chars", 8000)),
+    ),
+    "doc_list": lambda ctx, args: doc_list(
+        ctx,
+        limit=int(args.get("limit", 20)),
+        offset=int(args.get("offset", 0)),
+        query=_as_opt_str(args, "query"),
+    ),
+    "doc_delete": lambda ctx, args: doc_delete(
+        ctx,
+        id=_as_opt_int(args, "id"),
+        key=_as_opt_str(args, "key"),
+    ),
+    "sh_exec": _dispatch_sh_exec,
+}
+
+
 def dispatch_tool_call(ctx: ToolContext, name: str, arguments_json: str) -> dict[str, Any]:
     try:
         args = json.loads(arguments_json or "{}")
@@ -730,307 +1010,9 @@ def dispatch_tool_call(ctx: ToolContext, name: str, arguments_json: str) -> dict
     if not isinstance(args, dict):
         raise ValueError(f"Tool arguments must be a JSON object for {name}")
 
-    if name == "text_search":
-        return text_search(
-            ctx,
-            query=str(args.get("query", "")),
-            path=str(args.get("path", ".")),
-            regex=bool(args.get("regex", False)),
-            case_sensitive=bool(args.get("case_sensitive", False)),
-            include_glob=(None if args.get("include_glob") is None else str(args.get("include_glob"))),
-            exclude_glob=(None if args.get("exclude_glob") is None else str(args.get("exclude_glob"))),
-            max_results=int(args.get("max_results", 20)),
-            max_files=int(args.get("max_files", 200)),
-            context_lines=int(args.get("context_lines", 0)),
-        )
-
-    if name == "fs_read":
-        return fs_read(
-            ctx,
-            path=str(args.get("path", "")),
-            start_line=int(args.get("start_line", 1)),
-            end_line=(None if args.get("end_line") is None else int(args.get("end_line"))),
-        )
-    if name == "fs_write":
-        return fs_write(
-            ctx,
-            path=str(args.get("path", "")),
-            content=str(args.get("content", "")),
-            mode=str(args.get("mode", "overwrite")),
-            make_parents=bool(args.get("make_parents", True)),
-        )
-    if name == "fs_mkdir":
-        return fs_mkdir(
-            ctx,
-            path=str(args.get("path", "")),
-            parents=bool(args.get("parents", True)),
-            exist_ok=bool(args.get("exist_ok", True)),
-        )
-    if name == "fs_list":
-        return fs_list(
-            ctx,
-            path=str(args.get("path", ".")),
-            recursive=bool(args.get("recursive", False)),
-            max_depth=int(args.get("max_depth", 2)),
-        )
-    if name == "fs_stat":
-        return fs_stat(ctx, path=str(args.get("path", "")))
-    if name == "fs_glob":
-        mr = args.get("max_results")
-        return fs_glob(
-            ctx,
-            pattern=str(args.get("pattern", "")),
-            max_results=(None if mr is None else int(mr)),
-        )
-    if name == "fs_diff":
-        return fs_diff(
-            ctx,
-            path=str(args.get("path", "")),
-            content=str(args.get("content", "")),
-            context_lines=int(args.get("context_lines", 3)),
-        )
-    if name == "fs_rm":
-        return fs_rm(
-            ctx,
-            path=str(args.get("path", "")),
-            recursive=bool(args.get("recursive", False)),
-            missing_ok=bool(args.get("missing_ok", True)),
-        )
-    if name == "fs_mv":
-        return fs_mv(
-            ctx,
-            src=str(args.get("src", "")),
-            dst=str(args.get("dst", "")),
-            overwrite=bool(args.get("overwrite", False)),
-            make_parents=bool(args.get("make_parents", True)),
-        )
-    if name == "fs_cp":
-        return fs_cp(
-            ctx,
-            src=str(args.get("src", "")),
-            dst=str(args.get("dst", "")),
-            recursive=bool(args.get("recursive", False)),
-            overwrite=bool(args.get("overwrite", False)),
-            make_parents=bool(args.get("make_parents", True)),
-        )
-    if name == "web_search":
-        return web_search(
-            ctx,
-            query=str(args.get("query", "")),
-            max_results=int(args.get("max_results", 5)),
-            safesearch=str(args.get("safesearch", "moderate")),
-        )
-    if name == "web_fetch":
-        mb = args.get("max_bytes")
-        return web_fetch(
-            ctx,
-            url=str(args.get("url", "")),
-            max_bytes=(None if mb is None else int(mb)),
-            timeout_s=float(args.get("timeout_s", 20.0)),
-        )
-    if name == "http_request_json":
-        mb = args.get("max_bytes")
-        hdrs = args.get("headers")
-        if hdrs is not None and not isinstance(hdrs, dict):
-            raise ValueError("headers must be an object (map of string to string)")
-        return http_request_json(
-            ctx,
-            url=str(args.get("url", "")),
-            method=str(args.get("method", "GET")),
-            headers=(None if hdrs is None else {str(k): str(v) for k, v in hdrs.items()}),
-            json_body=args.get("json_body"),
-            timeout_s=float(args.get("timeout_s", 20.0)),
-            max_bytes=(None if mb is None else int(mb)),
-        )
-    if name == "timer_api_get":
-        mb = args.get("max_bytes")
-        return timer_api_get(
-            ctx,
-            endpoint=str(args.get("endpoint", "system_metrics")),
-            host=str(args.get("host", "127.0.0.1")),
-            port=int(args.get("port", 3000)),
-            timeout_s=float(args.get("timeout_s", 5.0)),
-            max_bytes=(None if mb is None else int(mb)),
-        )
-    if name == "google_email_list":
-        return google_email_list(
-            ctx,
-            bot_id=int(args.get("bot_id", 0)),
-            discord_user_id=int(args.get("discord_user_id", 0)),
-            query=(None if args.get("query") is None else str(args.get("query"))),
-            max_results=int(args.get("max_results", 10)),
-        )
-    if name == "google_email_get":
-        return google_email_get(
-            ctx,
-            bot_id=int(args.get("bot_id", 0)),
-            discord_user_id=int(args.get("discord_user_id", 0)),
-            message_id=str(args.get("message_id", "")),
-        )
-    if name == "google_email_send":
-        return google_email_send(
-            ctx,
-            bot_id=int(args.get("bot_id", 0)),
-            discord_user_id=int(args.get("discord_user_id", 0)),
-            to=str(args.get("to", "")),
-            subject=str(args.get("subject", "")),
-            body_text=str(args.get("body_text", "")),
-            cc=(None if args.get("cc") is None else str(args.get("cc"))),
-            bcc=(None if args.get("bcc") is None else str(args.get("bcc"))),
-        )
-    if name == "google_calendar_list":
-        return google_calendar_list(
-            ctx,
-            bot_id=int(args.get("bot_id", 0)),
-            discord_user_id=int(args.get("discord_user_id", 0)),
-            calendar_id=str(args.get("calendar_id", "primary")),
-            time_min=(None if args.get("time_min") is None else str(args.get("time_min"))),
-            time_max=(None if args.get("time_max") is None else str(args.get("time_max"))),
-            max_results=int(args.get("max_results", 10)),
-        )
-    if name == "google_calendar_create":
-        return google_calendar_create(
-            ctx,
-            bot_id=int(args.get("bot_id", 0)),
-            discord_user_id=int(args.get("discord_user_id", 0)),
-            summary=str(args.get("summary", "")),
-            start_iso=str(args.get("start_iso", "")),
-            end_iso=str(args.get("end_iso", "")),
-            calendar_id=str(args.get("calendar_id", "primary")),
-            description=(None if args.get("description") is None else str(args.get("description"))),
-            location=(None if args.get("location") is None else str(args.get("location"))),
-        )
-    if name == "memory_add":
-        return memory_add(
-            ctx,
-            content=str(args.get("content", "")),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-            tags=(None if args.get("tags") is None else list(args.get("tags"))),
-            meta=(None if args.get("meta") is None else dict(args.get("meta"))),
-            pinned=bool(args.get("pinned", False)),
-            ttl_seconds=(None if args.get("ttl_seconds") is None else int(args.get("ttl_seconds"))),
-        )
-    if name == "memory_get":
-        return memory_get(
-            ctx,
-            id=(None if args.get("id") is None else int(args.get("id"))),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-            include_expired=bool(args.get("include_expired", False)),
-        )
-    if name == "memory_search":
-        return memory_search(
-            ctx,
-            query=str(args.get("query", "")),
-            limit=int(args.get("limit", 5)),
-            include_expired=bool(args.get("include_expired", False)),
-        )
-    if name == "memory_delete":
-        return memory_delete(
-            ctx,
-            id=(None if args.get("id") is None else int(args.get("id"))),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-        )
-    if name == "task_list":
-        return task_list(
-            ctx,
-            include_disabled=bool(args.get("include_disabled", True)),
-        )
-    if name == "task_add":
-        return task_add(
-            ctx,
-            minutes=int(args.get("minutes", 0)),
-            task=str(args.get("task", "")),
-            enabled=bool(args.get("enabled", True)),
-            allow_duplicate=bool(args.get("allow_duplicate", False)),
-        )
-    if name == "task_update":
-        return task_update(
-            ctx,
-            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
-            task=(None if args.get("task") is None else str(args.get("task"))),
-            new_minutes=(None if args.get("new_minutes") is None else int(args.get("new_minutes"))),
-            new_task=(None if args.get("new_task") is None else str(args.get("new_task"))),
-        )
-    if name == "task_disable":
-        return task_disable(
-            ctx,
-            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
-            task=(None if args.get("task") is None else str(args.get("task"))),
-        )
-    if name == "task_enable":
-        return task_enable(
-            ctx,
-            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
-            task=(None if args.get("task") is None else str(args.get("task"))),
-        )
-    if name == "task_run_now":
-        return task_run_now(
-            ctx,
-            task_id=(None if args.get("task_id") is None else int(args.get("task_id"))),
-            task=(None if args.get("task") is None else str(args.get("task"))),
-        )
-    if name == "doc_ingest":
-        return doc_ingest(
-            ctx,
-            path=str(args.get("path", "")),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-            title=(None if args.get("title") is None else str(args.get("title"))),
-            replace=bool(args.get("replace", True)),
-            max_chars=int(args.get("max_chars", 200000)),
-        )
-    if name == "doc_inject":
-        return doc_ingest(
-            ctx,
-            path=str(args.get("path", "")),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-            title=(None if args.get("title") is None else str(args.get("title"))),
-            replace=bool(args.get("replace", True)),
-            max_chars=int(args.get("max_chars", 200000)),
-        )
-    if name == "doc_search":
-        return doc_search(
-            ctx,
-            query=str(args.get("query", "")),
-            limit=int(args.get("limit", 5)),
-        )
-    if name == "doc_get":
-        return doc_get(
-            ctx,
-            id=(None if args.get("id") is None else int(args.get("id"))),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-            include_content=bool(args.get("include_content", True)),
-            max_chars=int(args.get("max_chars", 8000)),
-        )
-    if name == "doc_list":
-        return doc_list(
-            ctx,
-            limit=int(args.get("limit", 20)),
-            offset=int(args.get("offset", 0)),
-            query=(None if args.get("query") is None else str(args.get("query"))),
-        )
-    if name == "doc_delete":
-        return doc_delete(
-            ctx,
-            id=(None if args.get("id") is None else int(args.get("id"))),
-            key=(None if args.get("key") is None else str(args.get("key"))),
-        )
-    if name == "sh_exec":
-        argv = args.get("argv")
-        if not isinstance(argv, list):
-            raise ValueError("argv must be a list of strings")
-        env = args.get("env")
-        if env is not None and not isinstance(env, dict):
-            raise ValueError("env must be an object (map of string to string)")
-        return sh_exec(
-            ctx,
-            argv=[str(x) for x in argv],
-            stdin=(None if args.get("stdin") is None else str(args.get("stdin"))),
-            env=(None if env is None else {str(k): str(v) for k, v in env.items()}),
-            timeout_s=(None if args.get("timeout_s") is None else float(args.get("timeout_s"))),
-            max_output_bytes=(
-                None if args.get("max_output_bytes") is None else int(args.get("max_output_bytes"))
-            ),
-        )
+    fn = _TOOL_DISPATCHERS.get(name)
+    if fn is not None:
+        return fn(ctx, args)
 
     # Custom tools (loaded from disk under tool_root).
     try:

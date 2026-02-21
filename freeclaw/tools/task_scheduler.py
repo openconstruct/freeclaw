@@ -27,6 +27,12 @@ def _tasks_path(ctx: ToolContext) -> Path:
 
 
 def _state_path(ctx: ToolContext) -> Path:
+    # Keep timer state with other runtime data; avoid creating workspace/.freeclaw
+    # just for last-run bookkeeping.
+    return ctx.workspace / "mem" / "task_timer_state.json"
+
+
+def _legacy_state_path(ctx: ToolContext) -> Path:
     return ctx.workspace / ".freeclaw" / "task_timer_state.json"
 
 
@@ -111,12 +117,11 @@ def _find_entry(entries: list[TaskEntry], *, task_id: int | None, task: str | No
     return matches[0]
 
 
-def _load_last_run(ctx: ToolContext) -> dict[str, int]:
-    p = _state_path(ctx)
+def _read_last_run(path: Path) -> dict[str, int]:
     try:
-        if not p.exists() or not p.is_file():
+        if not path.exists() or not path.is_file():
             return {}
-        obj = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         if not isinstance(obj, dict):
             return {}
         lr = obj.get("last_run")
@@ -135,11 +140,30 @@ def _load_last_run(ctx: ToolContext) -> dict[str, int]:
         return {}
 
 
+def _load_last_run(ctx: ToolContext) -> dict[str, int]:
+    p = _state_path(ctx)
+    out = _read_last_run(p)
+    if out or (p.exists() and p.is_file()):
+        return out
+    return _read_last_run(_legacy_state_path(ctx))
+
+
 def _save_last_run(ctx: ToolContext, last_run: dict[str, int]) -> None:
     p = _state_path(ctx)
     p.parent.mkdir(parents=True, exist_ok=True)
     obj = {"version": 1, "last_run": {str(k): int(v) for k, v in (last_run or {}).items()}}
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    lp = _legacy_state_path(ctx)
+    try:
+        if lp.exists() and lp.is_file() and lp.resolve() != p.resolve():
+            lp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        if lp.parent.name == ".freeclaw":
+            lp.parent.rmdir()
+    except Exception:
+        pass
 
 
 def task_list(

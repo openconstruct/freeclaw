@@ -33,7 +33,7 @@ class ClawConfig:
     provider: str = "nim"
     base_url: str = "https://integrate.api.nvidia.com/v1"
     model: str | None = None
-    assistant_name: str = "Freeclaw"
+    assistant_name: str = "Freebot"
     assistant_tone: str = "Direct, pragmatic, concise. Ask clarifying questions when needed."
     temperature: float = 0.7
     max_tokens: int = 1024
@@ -53,6 +53,7 @@ class ClawConfig:
     discord_prefix: str = "!claw"
     discord_history_messages: int = 40
     discord_respond_to_all: bool = False
+    discord_session_scope: str = "channel"
     discord_app_id: str | None = None
 
     @staticmethod
@@ -74,7 +75,7 @@ class ClawConfig:
             provider=str(d.get("provider") or "nim"),
             base_url=str(d.get("base_url") or "https://integrate.api.nvidia.com/v1"),
             model=(str(d["model"]) if d.get("model") else None),
-            assistant_name=str(d.get("assistant_name") or "Freeclaw"),
+            assistant_name=str(d.get("assistant_name") or "Freebot"),
             assistant_tone=str(
                 d.get("assistant_tone")
                 or "Direct, pragmatic, concise. Ask clarifying questions when needed."
@@ -95,6 +96,7 @@ class ClawConfig:
             discord_prefix=str(d.get("discord_prefix") or "!claw"),
             discord_history_messages=int(d.get("discord_history_messages", 40)),
             discord_respond_to_all=bool(d.get("discord_respond_to_all", False)),
+            discord_session_scope=(str(d.get("discord_session_scope") or "channel").strip() or "channel"),
             discord_app_id=(str(d["discord_app_id"]).strip() if d.get("discord_app_id") else None),
         )
 
@@ -122,6 +124,7 @@ class ClawConfig:
             "discord_prefix": self.discord_prefix,
             "discord_history_messages": self.discord_history_messages,
             "discord_respond_to_all": bool(self.discord_respond_to_all),
+            "discord_session_scope": self.discord_session_scope,
             "discord_app_id": (self.discord_app_id or None),
         }
 
@@ -150,6 +153,7 @@ def load_config(path: str | None) -> ClawConfig:
     discord_prefix = os.getenv("FREECLAW_DISCORD_PREFIX")
     discord_history_messages = os.getenv("FREECLAW_DISCORD_HISTORY_MESSAGES")
     discord_respond_to_all = os.getenv("FREECLAW_DISCORD_RESPOND_TO_ALL")
+    discord_session_scope = os.getenv("FREECLAW_DISCORD_SESSION_SCOPE")
     discord_app_id = os.getenv("FREECLAW_DISCORD_APP_ID")
 
     return ClawConfig(
@@ -193,6 +197,11 @@ def load_config(path: str | None) -> ClawConfig:
             if discord_respond_to_all is not None
             else cfg.discord_respond_to_all
         ),
+        discord_session_scope=(
+            discord_session_scope.strip()
+            if discord_session_scope and discord_session_scope.strip()
+            else cfg.discord_session_scope
+        ),
         discord_app_id=(discord_app_id.strip() if discord_app_id and discord_app_id.strip() else cfg.discord_app_id),
     )
 
@@ -208,7 +217,7 @@ def write_default_config(path: str | None) -> Path:
         "provider": "nim",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "model": None,
-        "assistant_name": "Freeclaw",
+        "assistant_name": "Freebot",
         "assistant_tone": "Direct, pragmatic, concise. Ask clarifying questions when needed.",
         "temperature": 0.7,
         "max_tokens": 1024,
@@ -226,6 +235,7 @@ def write_default_config(path: str | None) -> Path:
         "discord_prefix": "!claw",
         "discord_history_messages": 40,
         "discord_respond_to_all": False,
+        "discord_session_scope": "channel",
         "discord_app_id": None,
     }
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")

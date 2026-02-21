@@ -24,6 +24,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from .agents import agent_config_path, agent_env_path, iter_agents, resolve_agent_name, validate_agent_name
 from .agent import run_agent
+from .common import safe_label
 from .config import (
     ClawConfig,
     load_config,
@@ -31,6 +32,7 @@ from .config import (
     save_config_dict,
     write_default_config,
 )
+from .cli_parser import build_main_parser
 from .dotenv import autoload_dotenv, load_dotenv
 from .google_guide import google_md_text
 from .google_oauth import (
@@ -74,10 +76,10 @@ Tool rules:
 - Use tools.md (in workspace) as the canonical human-readable tool list. Consult it for tool names and usage.
 
 Custom tools:
-- By default, freeclaw loads additional tools from JSON specs under `.freeclaw/tools` (within workspace).
+- By default, freeclaw loads additional tools from JSON specs under `skills/tools` (within workspace).
 - Supported locations:
-  - `.freeclaw/tools/<name>.json`
-  - `.freeclaw/tools/<name>/tool.json`
+  - `skills/tools/<name>.json`
+  - `skills/tools/<name>/tool.json`
 - Spec fields (type=command):
   - `name`, `description`, `argv` (array of strings), `parameters` (JSON schema)
   - Optional: `workdir` ("tool_root" or "tool_dir"), `env` (map), `stdin` (string), `parse_json` (bool)
@@ -145,11 +147,169 @@ class _TaskTimerTarget:
     runtime: _TaskTimerRuntime
 
 
+@dataclass(frozen=True)
+class _ToolRuntime:
+    tool_ctx: ToolContext | None
+    tools_builder: Any
+    include_shell: bool
+    tool_root: Path
+    workspace: Path
+
+
+def _maybe_setup_logging_from_args(args: argparse.Namespace) -> None:
+    if (
+        args.log_level is not None
+        or args.log_file is not None
+        or getattr(args, "log_format", None) is not None
+    ):
+        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
+
+
+def _effective_runtime_values(cfg: ClawConfig, args: argparse.Namespace) -> tuple[float, int, int]:
+    temperature = args.temperature if args.temperature is not None else cfg.temperature
+    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.max_tokens
+    max_tool_steps = args.max_tool_steps if args.max_tool_steps is not None else cfg.max_tool_steps
+    return float(temperature), int(max_tokens), int(max_tool_steps)
+
+
+def _resolve_tool_toggle_overrides(
+    args: argparse.Namespace,
+    *,
+    default_enable_shell: bool | None,
+    default_enable_custom_tools: bool | None,
+) -> tuple[bool | None, bool | None]:
+    enable_shell = default_enable_shell
+    if bool(getattr(args, "no_shell", False)):
+        enable_shell = False
+    elif bool(getattr(args, "enable_shell", False)):
+        enable_shell = True
+
+    enable_custom_tools = default_enable_custom_tools
+    if bool(getattr(args, "no_custom_tools", False)):
+        enable_custom_tools = False
+    elif bool(getattr(args, "enable_custom_tools", False)):
+        enable_custom_tools = True
+    return enable_shell, enable_custom_tools
+
+
+def _build_tool_runtime(
+    cfg: ClawConfig,
+    args: argparse.Namespace,
+    *,
+    default_enable_shell: bool | None = None,
+    default_enable_custom_tools: bool | None = None,
+) -> _ToolRuntime:
+    no_tools = bool(getattr(args, "no_tools", False))
+    if no_tools:
+        return _ToolRuntime(
+            tool_ctx=None,
+            tools_builder=None,
+            include_shell=False,
+            tool_root=_resolve_tool_root(cfg, getattr(args, "tool_root", None)),
+            workspace=_resolve_workspace_root(cfg, getattr(args, "workspace", None)),
+        )
+
+    tool_root = (
+        args.tool_root
+        if getattr(args, "tool_root", None) is not None
+        else cfg.tool_root
+    )
+    workspace_dir = (
+        args.workspace
+        if getattr(args, "workspace", None) is not None
+        else cfg.workspace_dir
+    )
+    enable_shell, enable_custom_tools = _resolve_tool_toggle_overrides(
+        args,
+        default_enable_shell=default_enable_shell,
+        default_enable_custom_tools=default_enable_custom_tools,
+    )
+    tool_ctx = ToolContext.from_config_values(
+        tool_root=tool_root,
+        workspace_dir=workspace_dir,
+        max_read_bytes=cfg.tool_max_read_bytes,
+        max_write_bytes=cfg.tool_max_write_bytes,
+        max_list_entries=cfg.tool_max_list_entries,
+        enable_shell=enable_shell,
+        enable_custom_tools=enable_custom_tools,
+        custom_tools_dir=getattr(args, "custom_tools_dir", None),
+    )
+    tools_builder = lambda: tool_schemas(
+        include_shell=tool_ctx.shell_enabled,
+        include_custom=tool_ctx.custom_tools_enabled,
+        tool_ctx=tool_ctx,
+    )
+    return _ToolRuntime(
+        tool_ctx=tool_ctx,
+        tools_builder=tools_builder,
+        include_shell=bool(tool_ctx.shell_enabled),
+        tool_root=tool_ctx.root,
+        workspace=tool_ctx.workspace,
+    )
+
+
+def _resolve_base_system_and_skills(
+    cfg: ClawConfig,
+    args: argparse.Namespace,
+    *,
+    no_tools: bool,
+) -> tuple[str | None, str]:
+    base_system = getattr(args, "system", None)
+    if base_system is None and not no_tools:
+        base_system = DEFAULT_TOOL_SYSTEM
+    skills_block = "" if bool(getattr(args, "no_skills", False)) else render_enabled_skills_system(cfg)
+    return base_system, skills_block
+
+
+def _append_runtime_passthrough_args(
+    cmd: list[str],
+    args: argparse.Namespace,
+    *,
+    include_history_messages: bool = False,
+) -> None:
+    if getattr(args, "system", None) is not None:
+        cmd += ["--system", str(args.system)]
+    if getattr(args, "temperature", None) is not None:
+        cmd += ["--temperature", str(args.temperature)]
+    if getattr(args, "max_tokens", None) is not None:
+        cmd += ["--max-tokens", str(args.max_tokens)]
+    if bool(getattr(args, "no_tools", False)):
+        cmd += ["--no-tools"]
+    if bool(getattr(args, "enable_shell", False)):
+        cmd += ["--enable-shell"]
+    if bool(getattr(args, "no_shell", False)):
+        cmd += ["--no-shell"]
+    if bool(getattr(args, "enable_custom_tools", False)):
+        cmd += ["--enable-custom-tools"]
+    if bool(getattr(args, "no_custom_tools", False)):
+        cmd += ["--no-custom-tools"]
+    if getattr(args, "custom_tools_dir", None) is not None:
+        cmd += ["--custom-tools-dir", str(args.custom_tools_dir)]
+    if bool(getattr(args, "no_skills", False)):
+        cmd += ["--no-skills"]
+    if getattr(args, "workspace", None) is not None:
+        cmd += ["--workspace", str(args.workspace)]
+    if getattr(args, "tool_root", None) is not None:
+        cmd += ["--tool-root", str(args.tool_root)]
+    if getattr(args, "max_tool_steps", None) is not None:
+        cmd += ["--max-tool-steps", str(args.max_tool_steps)]
+    if bool(getattr(args, "verbose_tools", False)):
+        cmd += ["--verbose-tools"]
+    if include_history_messages and getattr(args, "history_messages", None) is not None:
+        cmd += ["--history-messages", str(args.history_messages)]
+
+
 def _task_timer_state_path(workspace: Path) -> Path:
+    # Keep timer state with other runtime data; avoid creating workspace/.freeclaw
+    # just for last-run bookkeeping.
+    return workspace / "mem" / "task_timer_state.json"
+
+
+def _task_timer_legacy_state_path(workspace: Path) -> Path:
     return workspace / ".freeclaw" / "task_timer_state.json"
 
 
-def _load_task_timer_last_run(path: Path) -> dict[str, int]:
+def _read_task_timer_last_run(path: Path) -> dict[str, int]:
     """
     Load per-task last-run timestamps (epoch seconds) for recurring tasks.
     Best-effort: returns {} if missing/invalid.
@@ -176,10 +336,37 @@ def _load_task_timer_last_run(path: Path) -> dict[str, int]:
         return {}
 
 
-def _save_task_timer_last_run(path: Path, last_run: dict[str, int]) -> None:
+def _load_task_timer_last_run(path: Path, *, legacy_path: Path | None = None) -> dict[str, int]:
+    out = _read_task_timer_last_run(path)
+    if out or (path.exists() and path.is_file()):
+        return out
+    if legacy_path is not None:
+        return _read_task_timer_last_run(legacy_path)
+    return {}
+
+
+def _save_task_timer_last_run(
+    path: Path,
+    last_run: dict[str, int],
+    *,
+    legacy_path: Path | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {"version": 1, "last_run": {str(k): int(v) for k, v in (last_run or {}).items()}}
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    if legacy_path is None:
+        return
+    try:
+        if legacy_path.exists() and legacy_path.is_file() and legacy_path.resolve() != path.resolve():
+            legacy_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        parent = legacy_path.parent
+        if parent.name == ".freeclaw":
+            parent.rmdir()
+    except Exception:
+        pass
 
 
 def _env_truthy(name: str, *, default: bool) -> bool:
@@ -379,14 +566,7 @@ def _task_timer_notify_discord(
 
 
 def _safe_bot_label(s: str) -> str:
-    out: list[str] = []
-    for ch in (s or "").strip():
-        if ch.isalnum() or ch in {"-", "_"}:
-            out.append(ch)
-        elif ch.isspace():
-            out.append("-")
-    v = "".join(out).strip("-_")
-    return v[:80] if v else "base"
+    return safe_label(s, fallback="base", max_len=80)
 
 
 def _resolve_timer_discord_bot_id_for_label(label: str) -> int | None:
@@ -449,16 +629,31 @@ def _resolve_timer_discord_channel_id_for_label(
         try:
             con = sqlite3.connect(str(db_path))
             try:
-                row = con.execute(
-                    """
-                    SELECT channel_id
-                    FROM discord_sessions_v2
-                    WHERE bot_id=?
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    """,
-                    (int(bot_id),),
-                ).fetchone()
+                row = None
+                try:
+                    row = con.execute(
+                        """
+                        SELECT last_channel_id
+                        FROM discord_sessions_v3
+                        WHERE bot_id=? AND platform='discord' AND last_channel_id IS NOT NULL
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (int(bot_id),),
+                    ).fetchone()
+                except Exception:
+                    row = None
+                if row is None:
+                    row = con.execute(
+                        """
+                        SELECT channel_id
+                        FROM discord_sessions_v2
+                        WHERE bot_id=?
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (int(bot_id),),
+                    ).fetchone()
             finally:
                 con.close()
         except Exception:
@@ -511,6 +706,18 @@ def _task_timer_recent_discord_context(
         rows_to_try.append(
             (
                 """
+                SELECT bot_id, COALESCE(last_channel_id, 0) AS channel_id, messages_json, updated_at
+                FROM discord_sessions_v3
+                WHERE bot_id=? AND platform='discord'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (int(bid),),
+            )
+        )
+        rows_to_try.append(
+            (
+                """
                 SELECT bot_id, channel_id, messages_json, updated_at
                 FROM discord_sessions_v2
                 WHERE bot_id=?
@@ -520,6 +727,18 @@ def _task_timer_recent_discord_context(
                 (int(bid),),
             )
         )
+    rows_to_try.append(
+        (
+            """
+            SELECT bot_id, COALESCE(last_channel_id, 0) AS channel_id, messages_json, updated_at
+            FROM discord_sessions_v3
+            WHERE platform='discord'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (),
+        )
+    )
     rows_to_try.append(
         (
             """
@@ -1097,7 +1316,7 @@ def _ensure_persona_md(workspace: Path, cfg: ClawConfig) -> None:
                     "Edit it to define and evolve the bot's persona.",
                     "",
                     "## Name",
-                    (cfg.assistant_name or "Freeclaw").strip() or "Freeclaw",
+                    (cfg.assistant_name or "Freebot").strip() or "Freebot",
                     "",
                     "## Tone",
                     (cfg.assistant_tone or "").strip() or "(not set)",
@@ -1129,6 +1348,18 @@ def _ensure_tools_md(workspace: Path, *, tool_ctx: ToolContext | None, include_s
                     "Concise tool index for Freeclaw.",
                     "",
                     _tool_list_system_for(tool_ctx=tool_ctx, include_shell=include_shell).strip(),
+                    "",
+                    "## Notes",
+                    "- Prefer the right family first: fs_*, task_*, doc_*, memory_*, web/http, shell.",
+                    "- `timer_api_get` is for local timer-api reads (`system_metrics`, `status`, `health`) on localhost only.",
+                    "- If needed, refer to live tool schemas in runtime for full parameters.",
+                    "",
+                    "## Discord File Attachments",
+                    "- Preferred in tool mode: call `discord_send_file` with `{ \"path\": \"...\", \"filename\": \"optional.ext\" }`.",
+                    "- To send a file in Discord, include a standalone line: `[[send_file:path/to/file]]`",
+                    "- Optional rename: `[[send_file:path/to/file as output.ext]]`",
+                    "- File paths must stay within the bot's allowed roots (workspace/tool root).",
+                    "- Limits: max 4 files per response, max 8 MB per file, max 20 MB total.",
                     "",
                 ]
             )
@@ -1390,12 +1621,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     client = _client_from_config(cfg)
 
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
-
-    temperature = args.temperature if args.temperature is not None else cfg.temperature
-    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.max_tokens
-    max_tool_steps = args.max_tool_steps if args.max_tool_steps is not None else cfg.max_tool_steps
+    _maybe_setup_logging_from_args(args)
+    temperature, max_tokens, max_tool_steps = _effective_runtime_values(cfg, args)
     log.info(
         "run start provider=%s model=%s tools=%s max_tokens=%d max_tool_steps=%d",
         (cfg.provider or "nim"),
@@ -1405,52 +1632,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         int(max_tool_steps),
     )
 
-    tool_ctx = None
-    tools_builder = None
-    include_shell = False
-    if not args.no_tools:
-        tool_root = args.tool_root if args.tool_root is not None else cfg.tool_root
-        workspace_dir = args.workspace if getattr(args, "workspace", None) is not None else cfg.workspace_dir
-        enable_shell = None
-        if getattr(args, "no_shell", False):
-            enable_shell = False
-        elif getattr(args, "enable_shell", False):
-            enable_shell = True
-        enable_custom_tools = None
-        if getattr(args, "no_custom_tools", False):
-            enable_custom_tools = False
-        elif getattr(args, "enable_custom_tools", False):
-            enable_custom_tools = True
-        tool_ctx = ToolContext.from_config_values(
-            tool_root=tool_root,
-            workspace_dir=workspace_dir,
-            max_read_bytes=cfg.tool_max_read_bytes,
-            max_write_bytes=cfg.tool_max_write_bytes,
-            max_list_entries=cfg.tool_max_list_entries,
-            enable_shell=enable_shell,
-            enable_custom_tools=enable_custom_tools,
-            custom_tools_dir=getattr(args, "custom_tools_dir", None),
-        )
-        include_shell = bool(tool_ctx.shell_enabled)
-        tools_builder = lambda: tool_schemas(
-            include_shell=tool_ctx.shell_enabled,
-            include_custom=tool_ctx.custom_tools_enabled,
-            tool_ctx=tool_ctx,
-        )
-
-    base_system = args.system
-    if base_system is None and not args.no_tools:
-        base_system = DEFAULT_TOOL_SYSTEM
-    skills_block = "" if args.no_skills else render_enabled_skills_system(cfg)
-    tool_root_p = tool_ctx.root if tool_ctx is not None else _resolve_tool_root(cfg, args.tool_root)
-    workspace_p = tool_ctx.workspace if tool_ctx is not None else _resolve_workspace_root(cfg, getattr(args, "workspace", None))
+    runtime = _build_tool_runtime(cfg, args)
+    tool_ctx = runtime.tool_ctx
+    tools_builder = runtime.tools_builder
+    base_system, skills_block = _resolve_base_system_and_skills(cfg, args, no_tools=bool(args.no_tools))
     core = _core_system_prelude(
         cfg,
-        tool_root=tool_root_p,
-        workspace=workspace_p,
+        tool_root=runtime.tool_root,
+        workspace=runtime.workspace,
         enable_tools=(not args.no_tools),
         tool_ctx=tool_ctx,
-        include_shell=include_shell,
+        include_shell=runtime.include_shell,
     )
     discord_harness_line = "You are operating in a harness called Freeclaw and are communicating via discord."
     system_prompt = _build_system_prompt(core + discord_harness_line + "\n\n" + (base_system or ""), skills_block)
@@ -1489,12 +1681,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     client = _client_from_config(cfg)
 
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
-
-    temperature = args.temperature if args.temperature is not None else cfg.temperature
-    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.max_tokens
-    max_tool_steps = args.max_tool_steps if args.max_tool_steps is not None else cfg.max_tool_steps
+    _maybe_setup_logging_from_args(args)
+    temperature, max_tokens, max_tool_steps = _effective_runtime_values(cfg, args)
     log.info(
         "chat start provider=%s model=%s tools=%s max_tokens=%d max_tool_steps=%d",
         (cfg.provider or "nim"),
@@ -1504,52 +1692,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
         int(max_tool_steps),
     )
 
-    tool_ctx = None
-    tools_builder = None
-    include_shell = False
-    if not args.no_tools:
-        tool_root = args.tool_root if args.tool_root is not None else cfg.tool_root
-        workspace_dir = args.workspace if getattr(args, "workspace", None) is not None else cfg.workspace_dir
-        enable_shell = None
-        if getattr(args, "no_shell", False):
-            enable_shell = False
-        elif getattr(args, "enable_shell", False):
-            enable_shell = True
-        enable_custom_tools = None
-        if getattr(args, "no_custom_tools", False):
-            enable_custom_tools = False
-        elif getattr(args, "enable_custom_tools", False):
-            enable_custom_tools = True
-        tool_ctx = ToolContext.from_config_values(
-            tool_root=tool_root,
-            workspace_dir=workspace_dir,
-            max_read_bytes=cfg.tool_max_read_bytes,
-            max_write_bytes=cfg.tool_max_write_bytes,
-            max_list_entries=cfg.tool_max_list_entries,
-            enable_shell=enable_shell,
-            enable_custom_tools=enable_custom_tools,
-            custom_tools_dir=getattr(args, "custom_tools_dir", None),
-        )
-        include_shell = bool(tool_ctx.shell_enabled)
-        tools_builder = lambda: tool_schemas(
-            include_shell=tool_ctx.shell_enabled,
-            include_custom=tool_ctx.custom_tools_enabled,
-            tool_ctx=tool_ctx,
-        )
-
-    base_system = args.system
-    if base_system is None and not args.no_tools:
-        base_system = DEFAULT_TOOL_SYSTEM
-    skills_block = "" if args.no_skills else render_enabled_skills_system(cfg)
-    tool_root_p = tool_ctx.root if tool_ctx is not None else _resolve_tool_root(cfg, args.tool_root)
-    workspace_p = tool_ctx.workspace if tool_ctx is not None else _resolve_workspace_root(cfg, getattr(args, "workspace", None))
+    runtime = _build_tool_runtime(cfg, args)
+    tool_ctx = runtime.tool_ctx
+    tools_builder = runtime.tools_builder
+    base_system, skills_block = _resolve_base_system_and_skills(cfg, args, no_tools=bool(args.no_tools))
     core = _core_system_prelude(
         cfg,
-        tool_root=tool_root_p,
-        workspace=workspace_p,
+        tool_root=runtime.tool_root,
+        workspace=runtime.workspace,
         enable_tools=(not args.no_tools),
         tool_ctx=tool_ctx,
-        include_shell=include_shell,
+        include_shell=runtime.include_shell,
     )
     system_prompt = _build_system_prompt(core + (base_system or ""), skills_block)
 
@@ -1568,11 +1721,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
     def _rebuild_system_prompt() -> str | None:
         core_now = _core_system_prelude(
             cfg,
-            tool_root=tool_root_p,
-            workspace=workspace_p,
+            tool_root=runtime.tool_root,
+            workspace=runtime.workspace,
             enable_tools=(not args.no_tools),
             tool_ctx=tool_ctx,
-            include_shell=include_shell,
+            include_shell=runtime.include_shell,
         )
         return _build_system_prompt(core_now + (base_system or ""), skills_block)
 
@@ -1756,53 +1909,21 @@ def _build_task_timer_runtime(args: argparse.Namespace) -> _TaskTimerRuntime:
     cfg = load_config(args.config)
     client = _client_from_config(cfg)
 
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
+    _maybe_setup_logging_from_args(args)
+    temperature, max_tokens, max_tool_steps = _effective_runtime_values(cfg, args)
 
-    temperature = args.temperature if args.temperature is not None else cfg.temperature
-    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.max_tokens
-    max_tool_steps = args.max_tool_steps if args.max_tool_steps is not None else cfg.max_tool_steps
-
-    tool_ctx = None
-    tools_builder = None
-    include_shell = False
-    if not args.no_tools:
-        tool_root = args.tool_root if args.tool_root is not None else cfg.tool_root
-        workspace_dir = args.workspace if getattr(args, "workspace", None) is not None else cfg.workspace_dir
-        # Timer ticks should run with full tool capability by default.
-        enable_shell = True
-        if getattr(args, "no_shell", False):
-            enable_shell = False
-        elif getattr(args, "enable_shell", False):
-            enable_shell = True
-        enable_custom_tools = True
-        if getattr(args, "no_custom_tools", False):
-            enable_custom_tools = False
-        elif getattr(args, "enable_custom_tools", False):
-            enable_custom_tools = True
-        tool_ctx = ToolContext.from_config_values(
-            tool_root=tool_root,
-            workspace_dir=workspace_dir,
-            max_read_bytes=cfg.tool_max_read_bytes,
-            max_write_bytes=cfg.tool_max_write_bytes,
-            max_list_entries=cfg.tool_max_list_entries,
-            enable_shell=enable_shell,
-            enable_custom_tools=enable_custom_tools,
-            custom_tools_dir=getattr(args, "custom_tools_dir", None),
-        )
-        include_shell = bool(tool_ctx.shell_enabled)
-        tools_builder = lambda: tool_schemas(
-            include_shell=tool_ctx.shell_enabled,
-            include_custom=tool_ctx.custom_tools_enabled,
-            tool_ctx=tool_ctx,
-        )
-
-    base_system = args.system
-    if base_system is None and not args.no_tools:
-        base_system = DEFAULT_TOOL_SYSTEM
-    skills_block = "" if args.no_skills else render_enabled_skills_system(cfg)
-    tool_root_p = tool_ctx.root if tool_ctx is not None else _resolve_tool_root(cfg, args.tool_root)
-    workspace_p = tool_ctx.workspace if tool_ctx is not None else _resolve_workspace_root(cfg, getattr(args, "workspace", None))
+    # Timer ticks should run with full tool capability by default.
+    runtime = _build_tool_runtime(
+        cfg,
+        args,
+        default_enable_shell=True,
+        default_enable_custom_tools=True,
+    )
+    tool_ctx = runtime.tool_ctx
+    tools_builder = runtime.tools_builder
+    base_system, skills_block = _resolve_base_system_and_skills(cfg, args, no_tools=bool(args.no_tools))
+    tool_root_p = runtime.tool_root
+    workspace_p = runtime.workspace
     if tool_ctx is not None:
         memory_db_p = Path(tool_ctx.memory_db_path).expanduser().resolve()
     else:
@@ -1908,7 +2029,7 @@ def _build_task_timer_runtime(args: argparse.Namespace) -> _TaskTimerRuntime:
         no_tools=bool(args.no_tools),
         tool_ctx=tool_ctx,
         tools_builder=tools_builder,
-        include_shell=include_shell,
+        include_shell=runtime.include_shell,
         base_system=base_system,
         skills_block=skills_block,
         tool_root=tool_root_p,
@@ -2051,7 +2172,8 @@ def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
         }
 
     state_p = _task_timer_state_path(runtime.workspace)
-    last_run = _load_task_timer_last_run(state_p)
+    legacy_state_p = _task_timer_legacy_state_path(runtime.workspace)
+    last_run = _load_task_timer_last_run(state_p, legacy_path=legacy_state_p)
     items = _iter_tasks(tasks_p)
     due, summary = _compute_due_tasks(items=items, last_run=last_run, now_s=now_s)
 
@@ -2212,7 +2334,7 @@ def _task_timer_tick(runtime: _TaskTimerRuntime) -> dict[str, Any]:
             last_run[str(k)] = int(now_s)
         known = {str(it.key) for it in items}
         last_run = {k: v for k, v in last_run.items() if k in known}
-        _save_task_timer_last_run(state_p, last_run)
+        _save_task_timer_last_run(state_p, last_run, legacy_path=legacy_state_p)
         out["ran"] = True
     else:
         out["ok"] = False
@@ -3437,6 +3559,12 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     provider = (cfg.provider or "nim").strip().lower()
     if provider not in {"nim", "openrouter", "groq"}:
         errs.append(f"provider must be 'nim', 'openrouter', or 'groq' (got {cfg.provider!r})")
+    discord_scope = str(getattr(cfg, "discord_session_scope", "channel") or "").strip().lower()
+    if discord_scope not in {"channel", "user", "global"}:
+        errs.append(
+            "discord_session_scope must be one of: 'channel', 'user', 'global' "
+            f"(got {getattr(cfg, 'discord_session_scope', None)!r})"
+        )
 
     # Provider/base_url sanity checks (best-effort).
     base_url = (cfg.base_url or "").strip().rstrip("/")
@@ -3648,11 +3776,16 @@ def _timer_api_running_on_localhost(*, port: int, timeout_s: float = 0.75) -> bo
     return isinstance(obj, dict) and str(obj.get("service") or "").strip() == "timer-api"
 
 
-def _build_discord_timer_sidecar_argv(args: argparse.Namespace, *, all_agents: bool = False) -> list[str]:
-    cmd: list[str] = [sys.executable, "-m", "freeclaw"]
+def _append_child_bootstrap_args(
+    cmd: list[str],
+    args: argparse.Namespace,
+    *,
+    include_config: bool,
+    agent_name: str | None = None,
+) -> None:
     if getattr(args, "env_file", None):
         cmd += ["--env-file", str(args.env_file)]
-    if getattr(args, "config", None):
+    if include_config and getattr(args, "config", None):
         cmd += ["--config", str(args.config)]
     if getattr(args, "log_level", None):
         cmd += ["--log-level", str(args.log_level)]
@@ -3660,7 +3793,15 @@ def _build_discord_timer_sidecar_argv(args: argparse.Namespace, *, all_agents: b
         cmd += ["--log-file", str(args.log_file)]
     if getattr(args, "log_format", None):
         cmd += ["--log-format", str(args.log_format)]
-    cmd += ["--no-onboard", "timer-api"]
+    cmd += ["--no-onboard"]
+    if agent_name:
+        cmd += ["--agent", str(agent_name)]
+
+
+def _build_discord_timer_sidecar_argv(args: argparse.Namespace, *, all_agents: bool = False) -> list[str]:
+    cmd: list[str] = [sys.executable, "-m", "freeclaw"]
+    _append_child_bootstrap_args(cmd, args, include_config=True, agent_name=None)
+    cmd += ["timer-api"]
     if bool(all_agents):
         cmd += ["--all-agents"]
     # Keep Discord auto-sidecar deterministic on a single port, while allowing public web access.
@@ -3701,59 +3842,20 @@ def cmd_discord(args: argparse.Namespace) -> int:
     )
     client = _client_from_config(cfg)
 
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
+    _maybe_setup_logging_from_args(args)
+    temperature, max_tokens, max_tool_steps = _effective_runtime_values(cfg, args)
 
-    temperature = args.temperature if args.temperature is not None else cfg.temperature
-    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.max_tokens
-    max_tool_steps = args.max_tool_steps if args.max_tool_steps is not None else cfg.max_tool_steps
-
-    tool_ctx = None
-    tools_builder = None
-    include_shell = False
-    if not args.no_tools:
-        tool_root = args.tool_root if args.tool_root is not None else cfg.tool_root
-        workspace_dir = args.workspace if getattr(args, "workspace", None) is not None else cfg.workspace_dir
-        enable_shell = None
-        if getattr(args, "no_shell", False):
-            enable_shell = False
-        elif getattr(args, "enable_shell", False):
-            enable_shell = True
-        enable_custom_tools = None
-        if getattr(args, "no_custom_tools", False):
-            enable_custom_tools = False
-        elif getattr(args, "enable_custom_tools", False):
-            enable_custom_tools = True
-        tool_ctx = ToolContext.from_config_values(
-            tool_root=tool_root,
-            workspace_dir=workspace_dir,
-            max_read_bytes=cfg.tool_max_read_bytes,
-            max_write_bytes=cfg.tool_max_write_bytes,
-            max_list_entries=cfg.tool_max_list_entries,
-            enable_shell=enable_shell,
-            enable_custom_tools=enable_custom_tools,
-            custom_tools_dir=getattr(args, "custom_tools_dir", None),
-        )
-        include_shell = bool(tool_ctx.shell_enabled)
-        tools_builder = lambda: tool_schemas(
-            include_shell=tool_ctx.shell_enabled,
-            include_custom=tool_ctx.custom_tools_enabled,
-            tool_ctx=tool_ctx,
-        )
-
-    base_system = args.system
-    if base_system is None and not args.no_tools:
-        base_system = DEFAULT_TOOL_SYSTEM
-    skills_block = "" if args.no_skills else render_enabled_skills_system(cfg)
-    tool_root_p = tool_ctx.root if tool_ctx is not None else _resolve_tool_root(cfg, args.tool_root)
-    workspace_p = tool_ctx.workspace if tool_ctx is not None else _resolve_workspace_root(cfg, getattr(args, "workspace", None))
+    runtime = _build_tool_runtime(cfg, args)
+    tool_ctx = runtime.tool_ctx
+    tools_builder = runtime.tools_builder
+    base_system, skills_block = _resolve_base_system_and_skills(cfg, args, no_tools=bool(args.no_tools))
     core = _core_system_prelude(
         cfg,
-        tool_root=tool_root_p,
-        workspace=workspace_p,
+        tool_root=runtime.tool_root,
+        workspace=runtime.workspace,
         enable_tools=(not args.no_tools),
         tool_ctx=tool_ctx,
-        include_shell=include_shell,
+        include_shell=runtime.include_shell,
     )
     system_prompt = _build_system_prompt(core + (base_system or ""), skills_block)
 
@@ -3795,7 +3897,12 @@ def cmd_discord(args: argparse.Namespace) -> int:
                     if args.history_messages is not None
                     else cfg.discord_history_messages
                 ),
-                workspace=workspace_p,
+                session_scope=(
+                    args.session_scope
+                    if getattr(args, "session_scope", None) is not None
+                    else getattr(cfg, "discord_session_scope", "channel")
+                ),
+                workspace=runtime.workspace,
                 bot_label=agent_label,
             )
         )
@@ -3830,19 +3937,12 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
 
     def _child_argv(label_agent: str | None) -> list[str]:
         cmd: list[str] = [sys.executable, "-m", "freeclaw"]
-        if getattr(args, "env_file", None):
-            cmd += ["--env-file", str(args.env_file)]
-        if label_agent is None and getattr(args, "config", None):
-            cmd += ["--config", str(args.config)]
-        if args.log_level:
-            cmd += ["--log-level", str(args.log_level)]
-        if args.log_file:
-            cmd += ["--log-file", str(args.log_file)]
-        if getattr(args, "log_format", None):
-            cmd += ["--log-format", str(args.log_format)]
-        cmd += ["--no-onboard"]
-        if label_agent:
-            cmd += ["--agent", label_agent]
+        _append_child_bootstrap_args(
+            cmd,
+            args,
+            include_config=(label_agent is None),
+            agent_name=label_agent,
+        )
 
         # Pass through Discord subcommand flags that are reasonably safe to apply to all bots.
         # Tokens are intentionally NOT propagated.
@@ -3851,36 +3951,9 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
             cmd += ["--prefix", str(args.prefix)]
         if bool(getattr(args, "respond_to_all", False)):
             cmd += ["--respond-to-all"]
-        if getattr(args, "system", None) is not None:
-            cmd += ["--system", str(args.system)]
-        if getattr(args, "temperature", None) is not None:
-            cmd += ["--temperature", str(args.temperature)]
-        if getattr(args, "max_tokens", None) is not None:
-            cmd += ["--max-tokens", str(args.max_tokens)]
-        if bool(getattr(args, "no_tools", False)):
-            cmd += ["--no-tools"]
-        if bool(getattr(args, "enable_shell", False)):
-            cmd += ["--enable-shell"]
-        if bool(getattr(args, "no_shell", False)):
-            cmd += ["--no-shell"]
-        if bool(getattr(args, "enable_custom_tools", False)):
-            cmd += ["--enable-custom-tools"]
-        if bool(getattr(args, "no_custom_tools", False)):
-            cmd += ["--no-custom-tools"]
-        if getattr(args, "custom_tools_dir", None) is not None:
-            cmd += ["--custom-tools-dir", str(args.custom_tools_dir)]
-        if bool(getattr(args, "no_skills", False)):
-            cmd += ["--no-skills"]
-        if getattr(args, "workspace", None) is not None:
-            cmd += ["--workspace", str(args.workspace)]
-        if getattr(args, "tool_root", None) is not None:
-            cmd += ["--tool-root", str(args.tool_root)]
-        if getattr(args, "max_tool_steps", None) is not None:
-            cmd += ["--max-tool-steps", str(args.max_tool_steps)]
-        if bool(getattr(args, "verbose_tools", False)):
-            cmd += ["--verbose-tools"]
-        if getattr(args, "history_messages", None) is not None:
-            cmd += ["--history-messages", str(args.history_messages)]
+        if getattr(args, "session_scope", None) is not None:
+            cmd += ["--session-scope", str(args.session_scope)]
+        _append_runtime_passthrough_args(cmd, args, include_history_messages=True)
         return cmd
 
     log.info("discord start mode=multi agents=%d", len(agent_names))
@@ -3981,8 +4054,7 @@ def _cmd_discord_all_agents(args: argparse.Namespace, agent_names: list[str]) ->
 
 
 def cmd_onboard(args: argparse.Namespace) -> int:
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
+    _maybe_setup_logging_from_args(args)
     env_path = run_onboarding(
         config_path=args.config,
         force=bool(getattr(args, "onboard_force", False)),
@@ -3995,8 +4067,7 @@ def cmd_onboard(args: argparse.Namespace) -> int:
 
 
 def cmd_onboard_createagent(args: argparse.Namespace) -> int:
-    if args.log_level is not None or args.log_file is not None or getattr(args, "log_format", None) is not None:
-        setup_logging(level=args.log_level, log_file=args.log_file, log_format=getattr(args, "log_format", None))
+    _maybe_setup_logging_from_args(args)
     created = run_create_agents(
         base_config_path=args.config,
         name=getattr(args, "name", None),
@@ -4098,468 +4169,28 @@ def main(argv: list[str] | None = None) -> int:
         for k, v in orig_env.items():
             os.environ[k] = v
 
-    parser = argparse.ArgumentParser(prog="freeclaw")
-    parser.add_argument(
-        "--agent",
-        default=None,
-        help="Agent profile name (shorthand for --config config/agents/<name>/config.json).",
+    parser = build_main_parser(
+        handlers={
+            "cmd_models": cmd_models,
+            "cmd_run": cmd_run,
+            "cmd_chat": cmd_chat,
+            "cmd_task_timer": cmd_task_timer,
+            "cmd_timer_api": cmd_timer_api,
+            "cmd_config_init": cmd_config_init,
+            "cmd_config_env_init": cmd_config_env_init,
+            "cmd_config_show": cmd_config_show,
+            "cmd_config_set": cmd_config_set,
+            "cmd_config_validate": cmd_config_validate,
+            "cmd_reset": cmd_reset,
+            "cmd_discord": cmd_discord,
+            "cmd_onboard": cmd_onboard,
+            "cmd_onboard_createagent": cmd_onboard_createagent,
+            "cmd_skill_list": cmd_skill_list,
+            "cmd_skill_show": cmd_skill_show,
+            "cmd_skill_enable": cmd_skill_enable,
+            "cmd_skill_disable": cmd_skill_disable,
+        }
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Path to config.json (default: ./config/config.json if present).",
-    )
-    parser.add_argument(
-        "--env-file",
-        default=None,
-        help="Explicit env file to load (overrides auto-load). You can also set FREECLAW_ENV_FILE.",
-    )
-    parser.add_argument("--no-onboard", action="store_true", help="Skip first-run onboarding wizard.")
-    parser.add_argument(
-        "--log-level",
-        default=None,
-        help="Logging level (debug, info, warning, error). You can also set FREECLAW_LOG_LEVEL.",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=None,
-        help="Log file path (default: <config>/freeclaw.log). You can also set FREECLAW_LOG_FILE.",
-    )
-    parser.add_argument(
-        "--log-format",
-        default=None,
-        choices=["text", "jsonl"],
-        help="Log format (text or jsonl). You can also set FREECLAW_LOG_FORMAT.",
-    )
-
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_models = sub.add_parser("models", help="List available model ids for the configured provider.")
-    p_models.add_argument(
-        "--provider",
-        choices=["nim", "openrouter", "groq"],
-        default=None,
-        help="Override provider (default from config).",
-    )
-    p_models.add_argument(
-        "--base-url",
-        dest="base_url",
-        default=None,
-        help="Override base URL (default from config).",
-    )
-    p_models.add_argument(
-        "--free-only",
-        dest="free_only",
-        action="store_true",
-        help="(openrouter) Only show free models (best-effort).",
-    )
-    p_models.set_defaults(func=cmd_models)
-
-    p_run = sub.add_parser("run", help="Run a single prompt.")
-    p_run.add_argument("prompt")
-    p_run.add_argument("--system", default=None, help="Optional system prompt.")
-    p_run.add_argument("--temperature", type=float, default=None)
-    p_run.add_argument("--max-tokens", type=int, default=None)
-    p_run.add_argument("--no-tools", action="store_true", help="Disable built-in tools.")
-    g_run_shell = p_run.add_mutually_exclusive_group()
-    g_run_shell.add_argument(
-        "--enable-shell",
-        action="store_true",
-        help="Enable sh_exec tool (command execution). (default: enabled)",
-    )
-    g_run_shell.add_argument(
-        "--no-shell",
-        action="store_true",
-        help="Disable sh_exec tool (command execution).",
-    )
-    g_run_custom = p_run.add_mutually_exclusive_group()
-    g_run_custom.add_argument(
-        "--enable-custom-tools",
-        action="store_true",
-        help="Enable loading custom tools from workspace/.freeclaw/tools. (default: enabled)",
-    )
-    g_run_custom.add_argument(
-        "--no-custom-tools",
-        action="store_true",
-        help="Disable loading custom tools (overrides FREECLAW_ENABLE_CUSTOM_TOOLS).",
-    )
-    p_run.add_argument(
-        "--custom-tools-dir",
-        default=None,
-        help="Override custom tools dir (must be within workspace). Default: workspace/.freeclaw/tools",
-    )
-    p_run.add_argument("--no-skills", action="store_true", help="Disable injecting enabled skills into system prompt.")
-    p_run.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory for persona.md/tools.md/custom tool specs (default from config/env).",
-    )
-    p_run.add_argument(
-        "--tool-root",
-        default=None,
-        help="Tool filesystem root (default from config/env; relative roots are resolved from cwd).",
-    )
-    p_run.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
-    p_run.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results.")
-    p_run.add_argument("--json", action="store_true", help="Print raw provider JSON response.")
-    p_run.set_defaults(func=cmd_run)
-
-    p_chat = sub.add_parser("chat", help="Interactive chat.")
-    p_chat.add_argument("--system", default=None, help="Optional system prompt.")
-    p_chat.add_argument("--temperature", type=float, default=None)
-    p_chat.add_argument("--max-tokens", type=int, default=None)
-    p_chat.add_argument("--no-tools", action="store_true", help="Disable built-in tools.")
-    g_chat_shell = p_chat.add_mutually_exclusive_group()
-    g_chat_shell.add_argument(
-        "--enable-shell",
-        action="store_true",
-        help="Enable sh_exec tool (command execution). (default: enabled)",
-    )
-    g_chat_shell.add_argument(
-        "--no-shell",
-        action="store_true",
-        help="Disable sh_exec tool (command execution).",
-    )
-    g_chat_custom = p_chat.add_mutually_exclusive_group()
-    g_chat_custom.add_argument(
-        "--enable-custom-tools",
-        action="store_true",
-        help="Enable loading custom tools from workspace/.freeclaw/tools. (default: enabled)",
-    )
-    g_chat_custom.add_argument(
-        "--no-custom-tools",
-        action="store_true",
-        help="Disable loading custom tools (overrides FREECLAW_ENABLE_CUSTOM_TOOLS).",
-    )
-    p_chat.add_argument(
-        "--custom-tools-dir",
-        default=None,
-        help="Override custom tools dir (must be within workspace). Default: workspace/.freeclaw/tools",
-    )
-    p_chat.add_argument("--no-skills", action="store_true", help="Disable injecting enabled skills into system prompt.")
-    p_chat.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory for persona.md/tools.md/custom tool specs (default from config/env).",
-    )
-    p_chat.add_argument(
-        "--tool-root",
-        default=None,
-        help="Tool filesystem root (default from config/env; relative roots are resolved from cwd).",
-    )
-    p_chat.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
-    p_chat.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results.")
-    p_chat.set_defaults(func=cmd_chat)
-
-    p_tt = sub.add_parser("task-timer", help="Periodically review workspace/tasks.md and complete unchecked tasks.")
-    p_tt.add_argument("--minutes", type=int, default=None, help="Interval minutes (default from config; 30). 0 disables.")
-    p_tt.add_argument("--once", action="store_true", help="Run a single tick and exit.")
-    p_tt.add_argument("--system", default=None, help="Optional system prompt.")
-    p_tt.add_argument("--temperature", type=float, default=None)
-    p_tt.add_argument("--max-tokens", type=int, default=None)
-    p_tt.add_argument("--no-tools", action="store_true", help="Disable built-in tools.")
-    g_tt_shell = p_tt.add_mutually_exclusive_group()
-    g_tt_shell.add_argument(
-        "--enable-shell",
-        action="store_true",
-        help="Enable sh_exec tool (command execution). (default: enabled)",
-    )
-    g_tt_shell.add_argument(
-        "--no-shell",
-        action="store_true",
-        help="Disable sh_exec tool (command execution).",
-    )
-    g_tt_custom = p_tt.add_mutually_exclusive_group()
-    g_tt_custom.add_argument(
-        "--enable-custom-tools",
-        action="store_true",
-        help="Enable loading custom tools from workspace/.freeclaw/tools. (default: enabled)",
-    )
-    g_tt_custom.add_argument(
-        "--no-custom-tools",
-        action="store_true",
-        help="Disable loading custom tools (overrides FREECLAW_ENABLE_CUSTOM_TOOLS).",
-    )
-    p_tt.add_argument(
-        "--custom-tools-dir",
-        default=None,
-        help="Override custom tools dir (must be within workspace). Default: workspace/.freeclaw/tools",
-    )
-    p_tt.add_argument("--no-skills", action="store_true", help="Disable injecting enabled skills into system prompt.")
-    p_tt.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory for persona.md/tools.md/custom tool specs (default from config/env).",
-    )
-    p_tt.add_argument(
-        "--tool-root",
-        default=None,
-        help="Tool filesystem root (default from config/env; relative roots are resolved from cwd).",
-    )
-    p_tt.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
-    p_tt.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results.")
-    p_tt.set_defaults(func=cmd_task_timer)
-
-    p_ta = sub.add_parser(
-        "timer-api",
-        help="Run an HTTP timer API server that auto-checks workspace/tasks.md and wakes the model when tasks are due.",
-    )
-    p_ta.add_argument("--minutes", type=int, default=None, help="Task timer interval minutes shown to the model (default from config; 30).")
-    p_ta.add_argument("--system", default=None, help="Optional system prompt.")
-    p_ta.add_argument("--temperature", type=float, default=None)
-    p_ta.add_argument("--max-tokens", type=int, default=None)
-    p_ta.add_argument("--no-tools", action="store_true", help="Disable built-in tools.")
-    g_ta_shell = p_ta.add_mutually_exclusive_group()
-    g_ta_shell.add_argument(
-        "--enable-shell",
-        action="store_true",
-        help="Enable sh_exec tool (command execution). (default: enabled)",
-    )
-    g_ta_shell.add_argument(
-        "--no-shell",
-        action="store_true",
-        help="Disable sh_exec tool (command execution).",
-    )
-    g_ta_custom = p_ta.add_mutually_exclusive_group()
-    g_ta_custom.add_argument(
-        "--enable-custom-tools",
-        action="store_true",
-        help="Enable loading custom tools from workspace/.freeclaw/tools. (default: enabled)",
-    )
-    g_ta_custom.add_argument(
-        "--no-custom-tools",
-        action="store_true",
-        help="Disable loading custom tools (overrides FREECLAW_ENABLE_CUSTOM_TOOLS).",
-    )
-    p_ta.add_argument(
-        "--custom-tools-dir",
-        default=None,
-        help="Override custom tools dir (must be within workspace). Default: workspace/.freeclaw/tools",
-    )
-    p_ta.add_argument("--no-skills", action="store_true", help="Disable injecting enabled skills into system prompt.")
-    p_ta.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory for persona.md/tools.md/custom tool specs (default from config/env).",
-    )
-    p_ta.add_argument(
-        "--tool-root",
-        default=None,
-        help="Tool filesystem root (default from config/env; relative roots are resolved from cwd).",
-    )
-    p_ta.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
-    p_ta.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results.")
-    p_ta.add_argument(
-        "--all-agents",
-        action="store_true",
-        help="Authoritative mode: check due tasks for base config plus all agent profiles on each tick.",
-    )
-    g_ta_web = p_ta.add_mutually_exclusive_group()
-    g_ta_web.add_argument(
-        "--web-ui",
-        dest="web_ui",
-        action="store_true",
-        default=None,
-        help="Enable Web UI dashboard routes (/ and /api/system/metrics).",
-    )
-    g_ta_web.add_argument(
-        "--no-web-ui",
-        dest="web_ui",
-        action="store_false",
-        help="Disable Web UI dashboard routes.",
-    )
-    p_ta.add_argument("--host", default="0.0.0.0", help="Bind host for timer API server (default: public bind).")
-    p_ta.add_argument(
-        "--allow-remote-host",
-        action="store_true",
-        help="Deprecated: public bind is now default. Timer control endpoints remain localhost-only.",
-    )
-    p_ta.add_argument(
-        "--localhost-only-host",
-        action="store_true",
-        help="Restrict timer-api bind host to localhost only.",
-    )
-    p_ta.add_argument("--port", type=int, default=None, help="Bind port for timer API server (default from config web_ui_port; 3000).")
-    p_ta.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=300.0,
-        help="Background scheduler poll interval in seconds (default: 300).",
-    )
-    p_ta.set_defaults(func=cmd_timer_api)
-
-    p_cfg = sub.add_parser("config", help="Config utilities.")
-    sub_cfg = p_cfg.add_subparsers(dest="cfg_cmd", required=True)
-    p_init = sub_cfg.add_parser("init", help="Write default config to ./config/config.json.")
-    p_init.add_argument(
-        "--path",
-        default=None,
-        help="Override config path (default: ./config/config.json).",
-    )
-    p_init.set_defaults(func=cmd_config_init)
-
-    p_env = sub_cfg.add_parser("env-init", help="Write a template .env file (default: ./config/.env).")
-    p_env.add_argument("--path", default=None, help="Path to write (default: ./config/.env).")
-    p_env.set_defaults(func=cmd_config_env_init)
-
-    p_show = sub_cfg.add_parser("show", help="Show config (merged with env overrides by default).")
-    p_show.add_argument("--raw", action="store_true", help="Show config.json contents only (no env overrides).")
-    p_show.add_argument("--quiet-path", action="store_true", help="Do not print config path to stderr.")
-    p_show.set_defaults(func=cmd_config_show)
-
-    p_set = sub_cfg.add_parser("set", help="Set a config key.")
-    p_set.add_argument("key", help="Config key (example: max_tool_steps).")
-    p_set.add_argument("value", help="Value (string by default; use --json for JSON).")
-    p_set.add_argument("--json", action="store_true", help="Parse value as JSON.")
-    p_set.set_defaults(func=cmd_config_set)
-
-    p_val = sub_cfg.add_parser("validate", help="Validate the effective config.")
-    p_val.add_argument("--quiet-path", action="store_true", help="Do not print config path to stderr.")
-    p_val.set_defaults(func=cmd_config_validate)
-
-    p_reset = sub.add_parser("reset", help="Delete ./config and ./workspace (fresh install).")
-    p_reset.add_argument("--yes", action="store_true", help="Do not prompt for confirmation.")
-    p_reset.add_argument(
-        "--dry-run",
-        dest="dry_run",
-        action="store_true",
-        help="Print what would be deleted, but do not delete anything.",
-    )
-    p_reset.set_defaults(func=cmd_reset)
-
-    p_discord = sub.add_parser("discord", help="Run a Discord bot that chats using the configured provider.")
-    p_discord.add_argument("--token", default=None, help="Discord bot token (or DISCORD_BOT_TOKEN).")
-    p_discord.add_argument(
-        "--no-all-agents",
-        action="store_true",
-        help="If multiple agents exist, do not auto-launch them; run only this bot.",
-    )
-    p_discord.add_argument("--prefix", default=None, help="Command prefix trigger (default from config).")
-    p_discord.add_argument(
-        "--respond-to-all",
-        action="store_true",
-        default=None,
-        help="Respond to every non-bot message in channels/DMs the bot can read (no prefix/mention required).",
-    )
-    p_discord.add_argument("--system", default=None, help="Optional system prompt.")
-    p_discord.add_argument("--temperature", type=float, default=None)
-    p_discord.add_argument("--max-tokens", type=int, default=None)
-    p_discord.add_argument("--no-tools", action="store_true", help="Disable built-in tools.")
-    g_discord_shell = p_discord.add_mutually_exclusive_group()
-    g_discord_shell.add_argument(
-        "--enable-shell",
-        action="store_true",
-        help="Enable sh_exec tool (command execution). (default: enabled)",
-    )
-    g_discord_shell.add_argument(
-        "--no-shell",
-        action="store_true",
-        help="Disable sh_exec tool (command execution).",
-    )
-    g_discord_custom = p_discord.add_mutually_exclusive_group()
-    g_discord_custom.add_argument(
-        "--enable-custom-tools",
-        action="store_true",
-        help="Enable loading custom tools from workspace/.freeclaw/tools. (default: enabled)",
-    )
-    g_discord_custom.add_argument(
-        "--no-custom-tools",
-        action="store_true",
-        help="Disable loading custom tools (overrides FREECLAW_ENABLE_CUSTOM_TOOLS).",
-    )
-    p_discord.add_argument(
-        "--custom-tools-dir",
-        default=None,
-        help="Override custom tools dir (must be within workspace). Default: workspace/.freeclaw/tools",
-    )
-    p_discord.add_argument("--no-skills", action="store_true", help="Disable injecting enabled skills into system prompt.")
-    p_discord.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory for persona.md/tools.md/custom tool specs (default from config/env).",
-    )
-    p_discord.add_argument(
-        "--tool-root",
-        default=None,
-        help="Tool filesystem root (default from config/env; relative roots are resolved from cwd).",
-    )
-    p_discord.add_argument("--max-tool-steps", type=int, default=None, help="Max tool loop steps (default from config; 50).")
-    p_discord.add_argument("--verbose-tools", action="store_true", help="Log tool calls/results to stderr.")
-    p_discord.add_argument(
-        "--history-messages",
-        type=int,
-        default=None,
-        help="How many non-system messages to retain per channel/DM session (default from config).",
-    )
-    p_discord.add_argument(
-        "--web-ui-host",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    p_discord.add_argument(
-        "--web-ui-public",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p_discord.add_argument(
-        "--web-ui-localonly",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p_discord.add_argument(
-        "--web-ui-port",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    p_discord.add_argument(
-        "--no-web-ui",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p_discord.add_argument(
-        "--no-web-ui-autostart",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    p_discord.set_defaults(func=cmd_discord)
-
-    p_onboard = sub.add_parser("onboard", help="Onboarding utilities.")
-    p_onboard.add_argument(
-        "--force",
-        dest="onboard_force",
-        action="store_true",
-        help="Run the main onboarding wizard even if already onboarded.",
-    )
-    p_onboard.set_defaults(func=cmd_onboard)
-    sub_onboard = p_onboard.add_subparsers(dest="onboard_cmd", required=False)
-    p_create = sub_onboard.add_parser(
-        "createagent",
-        help="Create a named agent profile (config + env + workspace) under config/agents/<name>/.",
-    )
-    p_create.add_argument("name", nargs="?", help="Agent name (example: salesbot)")
-    p_create.add_argument("--force", dest="create_force", action="store_true", help="Overwrite an existing agent.")
-    p_create.add_argument(
-        "--keep-provider",
-        dest="keep_provider",
-        action="store_true",
-        help="Keep provider from the base/current config instead of prompting for a new provider.",
-    )
-    p_create.set_defaults(func=cmd_onboard_createagent)
-
-    p_skill = sub.add_parser("skill", help="Skills: list/show/enable/disable")
-    sub_skill = p_skill.add_subparsers(dest="skill_cmd", required=True)
-    p_s_list = sub_skill.add_parser("list", help="List available skills (* = enabled).")
-    p_s_list.set_defaults(func=cmd_skill_list)
-    p_s_show = sub_skill.add_parser("show", help="Show a skill SKILL.md.")
-    p_s_show.add_argument("name")
-    p_s_show.set_defaults(func=cmd_skill_show)
-    p_s_en = sub_skill.add_parser("enable", help="Enable a skill by name.")
-    p_s_en.add_argument("name")
-    p_s_en.set_defaults(func=cmd_skill_enable)
-    p_s_dis = sub_skill.add_parser("disable", help="Disable a skill by name.")
-    p_s_dis.add_argument("name")
-    p_s_dis.set_defaults(func=cmd_skill_disable)
 
     args = parser.parse_args(argv)
     log.info("command parsed cmd=%s agent=%s config=%s", str(getattr(args, "cmd", "")), str(getattr(args, "agent", "") or "none"), str(getattr(args, "config", None) or "(default)"))

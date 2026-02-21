@@ -1,19 +1,12 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..common import first_env
 from ..config import ClawConfig
-from ..http_client import get_json, post_json
-
-
-def _first_env(*names: str) -> str | None:
-    for n in names:
-        v = os.getenv(n)
-        if v and v.strip():
-            return v.strip()
-    return None
+from ..http_client import post_json
+from .common import build_chat_payload, extract_chat_text, fetch_openai_models
 
 
 def _as_price(v: Any) -> float | None:
@@ -61,19 +54,10 @@ def fetch_models(*, base_url: str, api_key: str | None = None, timeout_s: float 
 
     Returns a list of dict entries (raw objects from OpenRouter), best-effort.
     """
-    url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {"Accept": "application/json", "User-Agent": "freeclaw/0.1.0"}
     if api_key and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
-    resp = get_json(url, headers=headers, timeout_s=float(timeout_s)).json
-    data = resp.get("data")
-    if not isinstance(data, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for m in data:
-        if isinstance(m, dict):
-            out.append(m)
-    return out
+    return fetch_openai_models(base_url=base_url, headers=headers, timeout_s=float(timeout_s))
 
 
 def model_ids(models: list[dict[str, Any]], *, free_only: bool = False) -> list[str]:
@@ -98,7 +82,7 @@ class OpenRouterChatClient:
 
     @staticmethod
     def from_config(cfg: ClawConfig) -> "OpenRouterChatClient":
-        api_key = _first_env("OPENROUTER_API_KEY", "OPENAI_API_KEY")
+        api_key = first_env("OPENROUTER_API_KEY", "OPENAI_API_KEY")
         if not api_key:
             raise SystemExit("Missing OpenRouter API key. Set OPENROUTER_API_KEY.")
 
@@ -126,8 +110,8 @@ class OpenRouterChatClient:
             "User-Agent": "freeclaw/0.1.0",
         }
         # Optional (recommended by OpenRouter): identify your app.
-        referer = _first_env("OPENROUTER_HTTP_REFERER", "FREECLAW_OPENROUTER_HTTP_REFERER")
-        title = _first_env("OPENROUTER_X_TITLE", "FREECLAW_OPENROUTER_X_TITLE")
+        referer = first_env("OPENROUTER_HTTP_REFERER", "FREECLAW_OPENROUTER_HTTP_REFERER")
+        title = first_env("OPENROUTER_X_TITLE", "FREECLAW_OPENROUTER_X_TITLE")
         if referer:
             headers["HTTP-Referer"] = referer
         if title:
@@ -166,34 +150,15 @@ class OpenRouterChatClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
-        payload: dict[str, Any] = {
-            "model": self._resolve_model(),
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = build_chat_payload(
+            model=self._resolve_model(),
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
         return post_json(url, headers=self._headers(), payload=payload, timeout_s=self.timeout_s).json
 
     @staticmethod
     def extract_text(resp: dict[str, Any]) -> str:
-        # OpenAI chat.completions shape.
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("Unexpected response: missing choices")
-        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(msg, dict):
-            raise RuntimeError("Unexpected response: missing message")
-        content = msg.get("content")
-        if content is None:
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                return "[tool call requested; tool execution not implemented in freeclaw yet]"
-            return ""
-        if not isinstance(content, str):
-            return str(content)
-        return content
-
+        return extract_chat_text(resp)

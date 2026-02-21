@@ -1,17 +1,10 @@
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..common import first_env
 from ..config import ClawConfig
-from ..http_client import get_json, post_json
-
-
-def _first_env(*names: str) -> str | None:
-    for n in names:
-        v = os.getenv(n)
-        if v and v.strip():
-            return v.strip()
-    return None
+from ..http_client import post_json
+from .common import build_chat_payload, extract_chat_text, fetch_openai_models, model_ids_from_entries
 
 
 @dataclass(frozen=True)
@@ -24,7 +17,7 @@ class NimChatClient:
 
     @staticmethod
     def from_config(cfg: ClawConfig) -> "NimChatClient":
-        api_key = _first_env("NVIDIA_API_KEY", "NIM_API_KEY", "NVIDIA_NIM_API_KEY")
+        api_key = first_env("NVIDIA_API_KEY", "NIM_API_KEY", "NVIDIA_NIM_API_KEY")
         if not api_key:
             raise SystemExit(
                 "Missing NVIDIA API key. Set NVIDIA_API_KEY (or NIM_API_KEY / NVIDIA_NIM_API_KEY)."
@@ -53,23 +46,17 @@ class NimChatClient:
             return self.model
         if self._resolved_model:
             return self._resolved_model
-        # Try OpenAI-compatible model listing; pick a reasonable default.
-        models_url = f"{self.base_url}/models"
-        resp = get_json(models_url, headers=self._headers(), timeout_s=self.timeout_s).json
-        data = resp.get("data")
-        if not isinstance(data, list) or not data:
+        models = fetch_openai_models(
+            base_url=self.base_url,
+            headers=self._headers(),
+            timeout_s=self.timeout_s,
+        )
+        ids = model_ids_from_entries(models)
+        if not ids:
             raise SystemExit(
                 "No model configured and /models did not return a non-empty list. "
                 "Set FREECLAW_MODEL."
             )
-
-        ids: list[str] = []
-        for m in data:
-            mid = m.get("id") if isinstance(m, dict) else None
-            if isinstance(mid, str) and mid.strip():
-                ids.append(mid.strip())
-        if not ids:
-            raise SystemExit("No model ids found in /models response. Set FREECLAW_MODEL.")
 
         # Prefer common instruct models if present.
         preferred = [
@@ -97,37 +84,18 @@ class NimChatClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}/chat/completions"
-        payload: dict[str, Any] = {
-            "model": self._resolve_model(),
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = build_chat_payload(
+            model=self._resolve_model(),
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
         return post_json(url, headers=self._headers(), payload=payload, timeout_s=self.timeout_s).json
 
     @staticmethod
     def extract_text(resp: dict[str, Any]) -> str:
-        # OpenAI chat.completions shape.
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("Unexpected response: missing choices")
-        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-        if not isinstance(msg, dict):
-            raise RuntimeError("Unexpected response: missing message")
-        content = msg.get("content")
-        if content is None:
-            # Some providers may return tool calls without content.
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                return "[tool call requested; tool execution not implemented in freeclaw yet]"
-            return ""
-        if not isinstance(content, str):
-            return str(content)
-        return content
+        return extract_chat_text(resp)
 
     @staticmethod
     def extract_tool_calls(resp: dict[str, Any]) -> list[dict[str, Any]]:

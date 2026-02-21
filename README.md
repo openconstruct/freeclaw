@@ -10,6 +10,7 @@ INstall
     cd freeclaw
     pip install -r requirements.txt
     python -m freeclaw onboard ( you will need an API key and a dicord bot key, I explain in detail here: https://medium.com/@jerryhowell/free-openclaw-alternative-freeclaw-ecf537abbcd0)
+    python -m freeclaw timer-api   # start once (shared scheduler)
     python -m freeclaw discord ( or chat if you want to chat via SSH )
 
 
@@ -58,10 +59,11 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_TIMER_DISCORD_CONTEXT` (default: `true`; include recent Discord session history in timer-run prompts)
 - `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_MESSAGES` (default: `24`; max recent user/assistant messages to include)
 - `FREECLAW_TIMER_DISCORD_CONTEXT_MAX_CHARS` (default: `12000`; char budget for injected Discord context)
+- `FREECLAW_DISCORD_SESSION_SCOPE` (default: `channel`; options: `channel`, `user`, `global`; controls how Discord conversation history is shared)
 - `FREECLAW_TOOL_MAX_READ_BYTES` (default: `200000`)
 - `FREECLAW_TOOL_MAX_WRITE_BYTES` (default: `2000000`)
 - `FREECLAW_TOOL_MAX_LIST_ENTRIES` (default: `2000`)
-- `FREECLAW_ASSISTANT_NAME` (default: `Freeclaw`)
+- `FREECLAW_ASSISTANT_NAME` (default: `Freebot`)
 - `FREECLAW_ASSISTANT_TONE` (default: `Direct, pragmatic, concise...`)
 - `FREECLAW_WEB_MAX_BYTES` (default: `500000`)
 - `FREECLAW_WEB_USER_AGENT` (default: `freeclaw/0.1.0 (+https://github.com/freeclaw/freeclaw)`)
@@ -77,7 +79,7 @@ Defaults are NIM-first. Override with env vars:
 - `FREECLAW_SHELL_MAX_OUTPUT_BYTES` (default: `200000`)
 - `FREECLAW_SHELL_BLOCK_NETWORK` (default: `false`; blocks `curl/wget/ssh/nc/...` in `sh_exec`)
 - `FREECLAW_ENABLE_CUSTOM_TOOLS` (default: enabled; set to `false` to disable loading custom tools from disk)
-- `FREECLAW_CUSTOM_TOOLS_DIR` (default: `<workspace>/.freeclaw/tools`; must be within workspace)
+- `FREECLAW_CUSTOM_TOOLS_DIR` (default: `<workspace>/skills/tools`; must be within workspace)
 - `FREECLAW_CUSTOM_TOOLS_BLOCK_NETWORK` (default: `false`; if `true`, blocks `curl/wget/ssh/nc/...` for custom tools)
 - `FREECLAW_LOG_LEVEL` (default: `info`)
 - `FREECLAW_LOG_FILE` (default: `./config/freeclaw.log`; set to empty string to disable file logging)
@@ -208,14 +210,14 @@ Additional tools:
 - Task scheduler: `task_*` manages recurring `tasks.md` entries (list/add/update/enable/disable/run-now) in structured form.
 - Docs: `doc_ingest`/`doc_inject`, `doc_search`, `doc_get`, `doc_list`, `doc_delete` build and manage a persistent workspace document index (text + PDF via `pypdf`).
 - Shell: `sh_exec` executes commands in `tool_root` (enabled by default; disable with `--no-shell` or `FREECLAW_ENABLE_SHELL=false`). Network tools are allowed by default; set `FREECLAW_SHELL_BLOCK_NETWORK=true` to block `curl/wget/ssh/nc/...`.
-- Custom: additional tools are loaded from JSON specs under `<workspace>/.freeclaw/tools` (enabled by default; disable with `--no-custom-tools` or `FREECLAW_ENABLE_CUSTOM_TOOLS=false`).
+- Custom: additional tools are loaded from JSON specs under `<workspace>/skills/tools` (enabled by default; disable with `--no-custom-tools` or `FREECLAW_ENABLE_CUSTOM_TOOLS=false`).
 
 ### Custom Tools (Dynamic)
 
 freeclaw loads tools from:
 
-- `<workspace>/.freeclaw/tools/<name>.json`
-- `<workspace>/.freeclaw/tools/<name>/tool.json`
+- `<workspace>/skills/tools/<name>.json`
+- `<workspace>/skills/tools/<name>/tool.json`
 
 Each file is a JSON object like:
 
@@ -369,6 +371,13 @@ When users send message attachments, the bot will download and parse:
 - Common text/code formats (`.txt`, `.md`, `.csv`, `.json`, `.html`, `.py`, etc.)
 
 Parsed attachment text is appended to the model prompt for that message.
+
+The bot can also send local files in its reply when the model emits a directive line:
+
+- `[[send_file:relative/path/from/workspace/or/tool_root]]`
+- Optional rename: `[[send_file:path as output-name.ext]]`
+
+For safety, outbound file paths are restricted to the configured workspace/tool roots.
 
 If you want the bot to respond to every message (no prefix needed):
 

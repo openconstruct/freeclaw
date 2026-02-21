@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 import shutil
 
+from ..paths import memory_db_path as _default_memory_db_path
+
 def _is_fs_root(p: Path) -> bool:
     try:
         return p == Path(p.anchor)
@@ -88,12 +90,15 @@ class ToolContext:
         if _is_fs_root(ws):
             ws = (Path.cwd() / "workspace").resolve()
 
-        # Default custom tools dir lives under workspace to keep specs/state separate from disk access root.
-        ctd = (
-            Path(custom_tools_dir).expanduser()
-            if custom_tools_dir and str(custom_tools_dir).strip()
-            else Path(os.getenv("FREECLAW_CUSTOM_TOOLS_DIR") or (ws / ".freeclaw" / "tools"))
-        )
+        # Default custom tools dir lives under workspace/skills/tools.
+        # This keeps custom tool specs in the bot workspace without relying on .freeclaw.
+        env_custom_tools_dir = os.getenv("FREECLAW_CUSTOM_TOOLS_DIR")
+        if custom_tools_dir and str(custom_tools_dir).strip():
+            ctd = Path(custom_tools_dir).expanduser()
+        elif env_custom_tools_dir and str(env_custom_tools_dir).strip():
+            ctd = Path(env_custom_tools_dir).expanduser()
+        else:
+            ctd = ws / "skills" / "tools"
         if not ctd.is_absolute():
             ctd = (ws / ctd).resolve()
         else:

@@ -54,7 +54,7 @@ def _prompt_yes_no(msg: str, default: bool) -> bool:
             return False
 
 
-def _slugify_workspace_name(name: str, *, fallback: str = "Freeclaw") -> str:
+def _slugify_workspace_name(name: str, *, fallback: str = "Freebot") -> str:
     """
     Convert an arbitrary display name into a safe workspace folder name.
     Reuses agent-name validation rules (letters/numbers/_/-).
@@ -312,7 +312,7 @@ def _write_startup_md(
             "This file documents the bot identity used by freeclaw prompts.",
             "",
             "## Name",
-            assistant_name.strip() or "Freeclaw",
+            assistant_name.strip() or "Freebot",
             "",
             "## Tone",
             assistant_tone.strip() or "(not set)",
@@ -349,7 +349,7 @@ def _ensure_persona_md(*, path: Path, assistant_name: str, assistant_tone: str) 
             "This is the bot's persistent persona file. freeclaw will include this file in the system prompt.",
             "",
             "## Name",
-            assistant_name.strip() or "Freeclaw",
+            assistant_name.strip() or "Freebot",
             "",
             "## Tone",
             assistant_tone.strip() or "(not set)",
@@ -379,7 +379,7 @@ def _write_persona_md(
             "This is the bot's persistent persona file. freeclaw will include this file in the system prompt.",
             "",
             "## Name",
-            assistant_name.strip() or "Freeclaw",
+            assistant_name.strip() or "Freebot",
             "",
             "## Tone",
             assistant_tone.strip() or "(not set)",
@@ -464,6 +464,13 @@ def _ensure_tools_md(*, path: Path) -> None:
             "- Prefer the right family first: fs_*, task_*, doc_*, memory_*, web/http, shell.",
             "- `timer_api_get` is for local timer-api reads (`system_metrics`, `status`, `health`) on localhost only.",
             "- If needed, refer to live tool schemas in runtime for full parameters.",
+            "",
+            "## Discord File Attachments",
+            "- Preferred in tool mode: call `discord_send_file` with `{ \"path\": \"...\", \"filename\": \"optional.ext\" }`.",
+            "- To send a file in Discord, include a standalone line: `[[send_file:path/to/file]]`",
+            "- Optional rename: `[[send_file:path/to/file as output.ext]]`",
+            "- File paths must stay within the bot's allowed roots (workspace/tool root).",
+            "- Limits: max 4 files per response, max 8 MB per file, max 20 MB total.",
             "",
         ]
     )
@@ -649,7 +656,7 @@ def run_onboarding(
             base_url = "https://api.groq.com/openai/v1"
         selected_model = _prompt_select_groq_model(base_url=base_url, api_key=api_key, current=cfg.model)
 
-    assistant_name = _prompt("Bot name", default=(cfg.assistant_name or "Freeclaw")).strip() or "Freeclaw"
+    assistant_name = _prompt("Bot name", default=(cfg.assistant_name or "Freebot")).strip() or "Freebot"
     assistant_tone = _prompt(
         "Bot tone (one sentence)",
         default=(cfg.assistant_tone or "Direct, pragmatic, concise. Ask clarifying questions when needed."),
@@ -708,7 +715,7 @@ def run_onboarding(
     workspace_root_p = Path(workspace_root_dir).expanduser().resolve()
     workspace_root_p.mkdir(parents=True, exist_ok=True)
 
-    base_ws_name = _slugify_workspace_name(assistant_name, fallback="Freeclaw")
+    base_ws_name = _slugify_workspace_name(assistant_name, fallback="Freebot")
     workspace_p = (workspace_root_p / base_ws_name).resolve()
     workspace_p.mkdir(parents=True, exist_ok=True)
     mem_root = (workspace_p / "mem").resolve()

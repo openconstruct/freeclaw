@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from .common import extract_finish_reason as _extract_finish_reason
 from .tools import ToolContext, dispatch_tool_call, tool_schemas
 
 log = logging.getLogger(__name__)
@@ -90,20 +91,6 @@ def _sanitize_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _extract_finish_reason(resp: dict[str, Any]) -> str | None:
-    try:
-        choices = resp.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return None
-        c0 = choices[0] if isinstance(choices[0], dict) else None
-        if not isinstance(c0, dict):
-            return None
-        fr = c0.get("finish_reason") or c0.get("stop_reason") or c0.get("finishReason")
-        return fr.strip() if isinstance(fr, str) and fr.strip() else None
-    except Exception:
-        return None
-
-
 def _is_tool_grammar_error(exc: Exception) -> bool:
     s = str(exc or "")
     if not s:
@@ -159,6 +146,7 @@ def run_agent(
     verbose_tools: bool = False,
     tools_override: list[dict[str, Any]] | None = None,
     tools_builder: Callable[[], list[dict[str, Any]]] | None = None,
+    tool_dispatcher: Callable[[ToolContext, str, str], dict[str, Any]] | None = None,
 ) -> AgentResult:
     log.debug(
         "agent start model=%s temperature=%.3f max_tokens=%d enable_tools=%s max_tool_steps=%d messages=%d",
@@ -327,7 +315,8 @@ def run_agent(
             log.info("[tool] %s %s", name, args_json)
 
             try:
-                result = dispatch_tool_call(tool_ctx, name, args_json)
+                dispatcher = tool_dispatcher or dispatch_tool_call
+                result = dispatcher(tool_ctx, name, args_json)
                 content = json.dumps(result, ensure_ascii=True)
             except Exception as e:
                 err: dict[str, Any] = {"ok": False, "tool": name, "error": str(e)}
