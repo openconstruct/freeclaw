@@ -10,7 +10,6 @@ INstall
     cd freeclaw
     pip install -r requirements.txt
     python -m freeclaw onboard ( you will need an API key and a dicord bot key, I explain in detail here: https://medium.com/@jerryhowell/free-openclaw-alternative-freeclaw-ecf537abbcd0)
-    python -m freeclaw timer-api   # start once (shared scheduler)
     python -m freeclaw discord ( or chat if you want to chat via SSH )
 
 
