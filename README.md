@@ -1,5 +1,6 @@
 # freeclaw
-<img width="1024" height="1024" alt="feeeclaw" src="https://github.com/user-attachments/assets/8f0c4556-3272-40fe-8ed4-28d1ac12792a" />
+<img width="950" height="640" alt="feeeclaw" src="https://github.com/user-attachments/assets/30f55d6a-f671-4d4c-bd45-f7a6196b2a4f" />
+
 
 Minimal OpenClaw-like CLI that supports NVIDIA NIM, OpenRouter, and Groq (OpenAI-compatible `/v1/chat/completions`).
 
