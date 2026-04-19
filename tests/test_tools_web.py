@@ -1,7 +1,7 @@
 import pytest
 import io
 import urllib.request
-from freeclaw.freeclaw.tools.web import (
+from freeclaw.tools.web import (
     web_fetch,
     web_search,
     _validate_url,
@@ -22,7 +22,7 @@ def test_html_parsing():
 
 def test_url_validation_ssrf():
     # Valid urls
-    assert _validate_url("https://google.com") == "https://google.com"
+    assert _validate_url("https://93.184.216.34") == "https://93.184.216.34"
     
     # Internal Network Blocks (SSRF Prevention)
     with pytest.raises(ValueError, match="Refusing to fetch from private/localhost"):
@@ -52,7 +52,7 @@ def test_web_fetch_mocked(tool_ctx, mocker):
             return self.data
             
         def geturl(self):
-            return "https://mocked.com"
+            return "https://93.184.216.34"
             
         def __enter__(self):
             return self
@@ -64,7 +64,7 @@ def test_web_fetch_mocked(tool_ctx, mocker):
     mocker.patch("urllib.request.OpenerDirector.open", return_value=MockResponse(mock_html))
     
     # Run fetch
-    res = web_fetch(ctx=tool_ctx, url="https://mocked.com")
+    res = web_fetch(ctx=tool_ctx, url="https://93.184.216.34")
     
     assert res["ok"] is True
     assert res["status"] == 200

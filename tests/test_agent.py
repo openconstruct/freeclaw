@@ -1,6 +1,6 @@
 import pytest
 import json
-from freeclaw.freeclaw.agent import run_agent, AgentResult
+from freeclaw.agent import run_agent, AgentResult
 
 class MockChatClient:
     def __init__(self, responses):

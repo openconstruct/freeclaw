@@ -2,7 +2,7 @@ import pytest
 import os
 import json
 from pathlib import Path
-from freeclaw.freeclaw.config import (
+from freeclaw.config import (
     load_config,
     write_default_config,
     ClawConfig

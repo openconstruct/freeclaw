@@ -1,6 +1,6 @@
 import pytest
 from pathlib import Path
-from freeclaw.freeclaw.tools.fs import ToolContext
+from freeclaw.tools.fs import ToolContext
 
 @pytest.fixture
 def temp_workspace(tmp_path):

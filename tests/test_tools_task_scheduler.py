@@ -1,5 +1,5 @@
 import pytest
-from freeclaw.freeclaw.tools.task_scheduler import (
+from freeclaw.tools.task_scheduler import (
     task_add,
     task_list,
     task_disable,
