@@ -23,6 +23,11 @@ discord = [
   "discord.py>=2.0.0",
   "pypdf>=5.0.0",
 ]
+test = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-mock",
+]
 
 [project.scripts]
 freeclaw = "freeclaw.cli:main"

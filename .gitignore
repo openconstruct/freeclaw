@@ -1,0 +1,23 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tests and virtual environments
+.venv/
+venv/
+.pytest_cache/
+
+# Executables and builds
+freeclaw.egg-info/
+build/
+dist/
+*.egg
+
+# Logs
+*.log
+
+# Project specific runtime data and configs
+config/
+.env
+workspace/
